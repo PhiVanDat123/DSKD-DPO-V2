@@ -1,4 +1,4 @@
-name: tis-dpo
+name: dskd-dpo
 channels:
   - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main/
   - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/free/

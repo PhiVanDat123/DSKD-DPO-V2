@@ -229,31 +229,56 @@ def get_collate_fn(tokenizer) -> Callable[[List[Dict]], Dict[str, Union[List, to
 
 
 def tokenize_batch_element(prompt: str, chosen: str, rejected: str, truncation_mode: str, tokenizer, max_length: int, max_prompt_length: int, rejected_weight=None, chosen_weight=None) -> Dict:
-    """Tokenize a single batch element.
-    
-       At this stage, we don't convert to PyTorch tensors yet; we just handle the truncation
-         in case the prompt + chosen or prompt + rejected responses is/are too long. First
-         we truncate the prompt; if we're still too long, we truncate the chosen/rejected.
-       
-       We also create the labels for the chosen/rejected responses, which are of length equal to
-         the sum of the length of the prompt and the chosen/rejected response, with -100 for the
-         prompt tokens.
+    """Tokenize a single batch element with robust handling of weights.
+
+    Accepts rejected_weight / chosen_weight as:
+      - None
+      - float or int (scalar) -> will be expanded to token length for that tokenizer
+      - list of numbers (will be truncated/padded to match token length)
+
+    Returns same structure as before.
     """
+    # Tokenize texts (no special tokens)
     chosen_tokens = tokenizer(chosen, add_special_tokens=False)
-    # len(chosen_tokens['input_ids'])  104
     rejected_tokens = tokenizer(rejected, add_special_tokens=False)
     prompt_tokens = tokenizer(prompt, add_special_tokens=False)
 
+    # Helper to normalize a weight into a list matching the tokenized text length
+    def _normalize_weight(weight, tokens, name="weight"):
+        token_len = len(tokens['input_ids'])
+        if weight is None:
+            return None
+        if isinstance(weight, (int, float)):
+            return [float(weight)] * token_len
+        if isinstance(weight, list):
+            if len(weight) == token_len:
+                return weight
+            # if provided length equals token_len - 1, maybe they omitted EOS weight -> append 0.0
+            if len(weight) == token_len - 1:
+                return list(weight) + [0.0]
+            # if longer -> truncate, if shorter -> pad with 0.0
+            if len(weight) > token_len:
+                return weight[:token_len]
+            else:
+                return list(weight) + [0.0] * (token_len - len(weight))
+        raise ValueError(f"Invalid {name} type: {type(weight)}")
+
+    # Normalize weights according to each tokenizer's token lengths
+    rejected_weight = _normalize_weight(rejected_weight, rejected_tokens, "rejected_weight")
+    chosen_weight = _normalize_weight(chosen_weight, chosen_tokens, "chosen_weight")
+
+    # Now the old asserts become safe (weights are lists of the required length)
     if rejected_weight is not None:
-        assert len(rejected_weight) == len(rejected_tokens['input_ids']) 
-    
+        assert len(rejected_weight) == len(rejected_tokens['input_ids'])
     if chosen_weight is not None:
         assert len(chosen_weight) == len(chosen_tokens['input_ids'])
-    
+
+    # Ensure EOS not present in inputs
     assert tokenizer.eos_token_id not in prompt_tokens['input_ids'], f"Prompt contains EOS token: {prompt}"
     assert tokenizer.eos_token_id not in chosen_tokens['input_ids'], f"Chosen response contains EOS token: {chosen}"
     assert tokenizer.eos_token_id not in rejected_tokens['input_ids'], f"Rejected response contains EOS token: {rejected}"
 
+    # append EOS to chosen/rejected tokens (attention mask too)
     chosen_tokens['input_ids'].append(tokenizer.eos_token_id)
     chosen_tokens['attention_mask'].append(1)
 
@@ -262,7 +287,7 @@ def tokenize_batch_element(prompt: str, chosen: str, rejected: str, truncation_m
 
     longer_response_length = max(len(chosen_tokens['input_ids']), len(rejected_tokens['input_ids']))
 
-    # if combined sequence is too long, truncate the prompt
+    # truncate prompt if needed
     if len(prompt_tokens['input_ids']) + longer_response_length > max_length:
         if truncation_mode == 'keep_start':
             prompt_tokens = {k: v[:max_prompt_length] for k, v in prompt_tokens.items()}
@@ -271,35 +296,40 @@ def tokenize_batch_element(prompt: str, chosen: str, rejected: str, truncation_m
         else:
             raise ValueError(f'Unknown truncation mode: {truncation_mode}')
 
-    # if that's still too long, truncate the response
+    # if still too long, truncate the responses
     if len(prompt_tokens['input_ids']) + longer_response_length > max_length:
-        # print('truncate=====', len(chosen_tokens['input_ids']), len(rejected_tokens['input_ids']))
         chosen_tokens = {k: v[:max_length - max_prompt_length] for k, v in chosen_tokens.items()}
         rejected_tokens = {k: v[:max_length - max_prompt_length] for k, v in rejected_tokens.items()}
 
-    # Create labels
+    # Recreate sequences (prompt + response)
     chosen_sequence_tokens = {k: prompt_tokens[k] + chosen_tokens[k] for k in chosen_tokens}
     rejected_sequence_tokens = {k: prompt_tokens[k] + rejected_tokens[k] for k in rejected_tokens}
+
+    # labels: prompt tokens -> -100, rest are token ids shifted appropriately
     chosen_sequence_tokens['labels'] = chosen_sequence_tokens['input_ids'][:]
     chosen_sequence_tokens['labels'][:len(prompt_tokens['input_ids'])] = [-100] * len(prompt_tokens['input_ids'])
     rejected_sequence_tokens['labels'] = rejected_sequence_tokens['input_ids'][:]
     rejected_sequence_tokens['labels'][:len(prompt_tokens['input_ids'])] = [-100] * len(prompt_tokens['input_ids'])
-    
+
     batch = {}
 
+    # Build weights for final sequences: prefix zeros for prompt, weights for response tokens (exclude EOS), final 0 for EOS
+    # Note: chosen_tokens/rejected_tokens after append include EOS, so we take weight up to len(tokens)-1
     if rejected_weight is not None:
-        batch['rejected_weight'] =  [0] * len(prompt_tokens['input_ids']) + rejected_weight[:len(rejected_tokens['input_ids'])-1] + [0]
+        batch['rejected_weight'] = [0] * len(prompt_tokens['input_ids']) + rejected_weight[:len(rejected_tokens['input_ids']) - 1] + [0]
     else:
-        batch['rejected_weight'] =  [0] * len(prompt_tokens['input_ids']) + [1]*(len(rejected_tokens['input_ids'])-1) + [0]
+        batch['rejected_weight'] = [0] * len(prompt_tokens['input_ids']) + [1] * (len(rejected_tokens['input_ids']) - 1) + [0]
 
     if chosen_weight is not None:
-        batch['chosen_weight'] =  [0] * len(prompt_tokens['input_ids']) + chosen_weight[:len(chosen_tokens['input_ids'])-1] + [0]
+        batch['chosen_weight'] = [0] * len(prompt_tokens['input_ids']) + chosen_weight[:len(chosen_tokens['input_ids']) - 1] + [0]
     else:
-        batch['chosen_weight'] =  [0] * len(prompt_tokens['input_ids']) + [1]*(len(chosen_tokens['input_ids'])-1) + [0]
+        batch['chosen_weight'] = [0] * len(prompt_tokens['input_ids']) + [1] * (len(chosen_tokens['input_ids']) - 1) + [0]
 
+    # sanity asserts (should hold after normalization)
     assert len(batch['chosen_weight']) == len(chosen_sequence_tokens['labels'])
     assert len(batch['rejected_weight']) == len(rejected_sequence_tokens['labels'])
 
+    # raw strings + constructed fields (same as original)
     batch['prompt'] = prompt
     batch['chosen'] = prompt + chosen
     batch['rejected'] = prompt + rejected
@@ -312,7 +342,6 @@ def tokenize_batch_element(prompt: str, chosen: str, rejected: str, truncation_m
                 continue
             batch[f'{k}_{type_key}'] = tokens
 
-    
     return batch
 
 
@@ -432,3 +461,194 @@ def strings_match_up_to_spaces(str_a: str, str_b: str) -> bool:
                     str_b = str_b[:idx] + str_b[idx + 1:]
 
     return True
+
+class CustomCollate:
+    def __init__(self, tokenizer: Dict):
+        self.tokenizer = tokenizer
+
+    def __call__(self, batch):
+        # first, pad everything to the same length
+        padded_batch = {}
+        batch_dict = {k: [d[k] for d in batch] for k in batch[0]}
+        for k in batch[0].keys():
+            if (
+                k.endswith("_input_ids")
+                or k.endswith("_attention_mask")
+                or k.endswith("_labels")
+                or k.endswith("_weight")
+            ):
+                if "prompt" in k:  # adapted from https://stackoverflow.com/questions/73256206
+                    to_pad = [torch.tensor(ex[k][::-1], dtype=torch.int) for ex in batch]
+                else:
+                    if k.endswith("_weight"):
+                        to_pad = [torch.tensor(ex[k], dtype=torch.float16) for ex in batch]
+                    else:
+                        to_pad = [torch.tensor(ex[k], dtype=torch.int) for ex in batch]
+                if k.endswith("_input_ids"):
+                    if "teacher" in k:
+                        padding_value = self.tokenizer["teacher"].eos_token_id
+                    else:
+                        padding_value = self.tokenizer["student"].eos_token_id
+                elif k.endswith("_labels"):
+                    padding_value = -100
+                elif k.endswith("_attention_mask") or k.endswith("_weight"):
+                    padding_value = 0
+                else:
+                    raise ValueError(f"Unexpected key in batch '{k}'")
+
+                padded_batch[k] = pad_sequence(
+                    to_pad, batch_first=True, padding_value=padding_value
+                )
+                if "prompt" in k:  # for the prompt, flip back so padding is on left side
+                    padded_batch[k] = padded_batch[k].flip(dims=[1])
+            else:
+                padded_batch[k] = [ex[k] for ex in batch]
+
+        # print("DEBUGGGG:", type(padded_batch))
+        # print("DEBUGGGG:", len(batch_dict))
+        # print("DEBUGGGG:", len(padded_batch))
+        # print("============================BATCH=================================")
+        # print(batch)
+        # print("============================BATCH=================================")
+        # print(padded_batch)
+        return padded_batch
+
+
+class DistillDPODataset(Dataset):
+    def __init__(self, local_file_path, student_tokenizer, teacher_tokenizer, max_length=64, max_prompt_length=32):
+        self.student_tokenizer = student_tokenizer
+        self.teacher_tokenizer = teacher_tokenizer
+        self.max_length = max_length
+        self.max_prompt_length = max_prompt_length
+
+        self.flat_data = []
+        with open(local_file_path, "r", encoding="utf-8") as f:
+            for line in f:
+                item = json.loads(line)
+                self.flat_data.append({
+                    "prompt": str(item.get("prompt", "")),
+                    "chosen": str(item.get("chosen", "")),
+                    "rejected": str(item.get("rejected", "")),
+                    "chosen_weight": item.get("chosen_weight", 1.0),
+                    "rejected_weight": item.get("rejected_weight", 1.0),
+                })
+
+    def __len__(self):
+        return len(self.flat_data)
+
+    def _weight_to_list(self, weight, text, tokenizer):
+        """Convert scalar or list weight to list matching token length for this tokenizer."""
+        if isinstance(weight, (float, int)):
+            token_len = len(tokenizer(text, add_special_tokens=False)["input_ids"])
+            return [float(weight)] * token_len
+        elif isinstance(weight, list):
+            return weight
+        else:
+            raise ValueError(f"Invalid weight type: {type(weight)}")
+
+    def __getitem__(self, idx):
+        item = self.flat_data[idx]
+        prompt, chosen, rejected = item["prompt"], item["chosen"], item["rejected"]
+
+        # === Student ===
+        student_chosen = tokenize_batch_element(
+            prompt,
+            chosen,
+            rejected,
+            "keep_start",
+            self.student_tokenizer,
+            self.max_length,
+            self.max_prompt_length,
+            rejected_weight=self._weight_to_list(item["rejected_weight"], rejected, self.student_tokenizer),
+            chosen_weight=self._weight_to_list(item["chosen_weight"], chosen, self.student_tokenizer),
+        )
+
+        student_rejected = tokenize_batch_element(
+            prompt,
+            rejected,
+            chosen,
+            "keep_start",
+            self.student_tokenizer,
+            self.max_length,
+            self.max_prompt_length,
+            rejected_weight=self._weight_to_list(item["chosen_weight"], chosen, self.student_tokenizer),
+            chosen_weight=self._weight_to_list(item["rejected_weight"], rejected, self.student_tokenizer),
+        )
+
+        # === Teacher ===
+        teacher_chosen = tokenize_batch_element(
+            prompt,
+            chosen,
+            rejected,
+            "keep_start",
+            self.teacher_tokenizer,
+            self.max_length,
+            self.max_prompt_length,
+            rejected_weight=self._weight_to_list(item["rejected_weight"], rejected, self.teacher_tokenizer),
+            chosen_weight=self._weight_to_list(item["chosen_weight"], chosen, self.teacher_tokenizer),
+        )
+
+        teacher_rejected = tokenize_batch_element(
+            prompt,
+            rejected,
+            chosen,
+            "keep_start",
+            self.teacher_tokenizer,
+            self.max_length,
+            self.max_prompt_length,
+            rejected_weight=self._weight_to_list(item["chosen_weight"], chosen, self.teacher_tokenizer),
+            chosen_weight=self._weight_to_list(item["rejected_weight"], rejected, self.teacher_tokenizer),
+        )
+
+        # === Merge helper (giữ nguyên logic cũ) ===
+        def merge_teacher_tokens(tokens_list):
+            merged = {}
+            keys = tokens_list[0].keys()
+            for key in keys:
+                if isinstance(tokens_list[0][key], list):
+                    if "weight" in key:
+                        merged[key] = [
+                            sum(t[key][i] for t in tokens_list) / len(tokens_list)
+                            for i in range(len(tokens_list[0][key]))
+                        ]
+                    else:
+                        merged[key] = tokens_list[0][key]
+                else:
+                    merged[key] = tokens_list[0][key]
+            return merged
+
+        teacher_chosen = merge_teacher_tokens([teacher_chosen])
+        teacher_rejected = merge_teacher_tokens([teacher_rejected])
+
+        # === Output dictionary ===
+        return {
+            # raw
+            "prompt": prompt,
+            "chosen": chosen,
+            "rejected": rejected,
+
+            # student (input, mask, label, weight)
+            "chosen_student_input_ids": student_chosen["chosen_input_ids"],
+            "chosen_student_attention_mask": student_chosen["chosen_attention_mask"],
+            "chosen_student_labels": student_chosen["chosen_labels"],
+            "chosen_student_weight": student_chosen["chosen_weight"],
+
+            "rejected_student_input_ids": student_rejected["chosen_input_ids"],
+            "rejected_student_attention_mask": student_rejected["chosen_attention_mask"],
+            "rejected_student_labels": student_rejected["chosen_labels"],
+            "rejected_student_weight": student_rejected["chosen_weight"],
+
+            # teacher (input, mask, label, weight)
+            "chosen_teacher_input_ids": teacher_chosen["chosen_input_ids"],
+            "chosen_teacher_attention_mask": teacher_chosen["chosen_attention_mask"],
+            "chosen_teacher_labels": teacher_chosen["chosen_labels"],
+            "chosen_teacher_weight": teacher_chosen["chosen_weight"],
+
+            "rejected_teacher_input_ids": teacher_rejected["chosen_input_ids"],
+            "rejected_teacher_attention_mask": teacher_rejected["chosen_attention_mask"],
+            "rejected_teacher_labels": teacher_rejected["chosen_labels"],
+            "rejected_teacher_weight": teacher_rejected["chosen_weight"],
+        }
+
+
+

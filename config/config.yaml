@@ -3,10 +3,10 @@ seed: 0
 
 
 # the batch size for training; for FSDP, the batch size per GPU is batch_size / (grad_accumulation_steps * num_gpus)
-batch_size: 4
+batch_size: 1
 
 # the batch size during evaluation and sampling, if enabled
-eval_batch_size: 16
+eval_batch_size: 1
 
 # debug mode (disables wandb, model checkpointing, etc.)
 debug: false
@@ -18,7 +18,7 @@ fsdp_port: null
 datasets:
 - hh
 
-base_data_dir: null
+base_data_dir: /home/hungpv/projects/DSKD-DPO
 
 reverse_dataset: false
 
@@ -48,7 +48,7 @@ do_first_eval: true
 local_run_dir: ${get_local_run_dir:${exp_name},${output_dir}}
 
 # name for this experiment in the local run directory and on wandb
-exp_name: ${build_exp_name:${loss.name},${model.name_or_path},${datasets},${reverse_dataset},${transform}}
+exp_name: ${build_exp_name:${loss.name},${model.policy_name_or_path},${datasets},${reverse_dataset}}
 
 # the learning rate
 lr: 5e-7
@@ -62,10 +62,10 @@ gradient_accumulation_steps: 1
 max_grad_norm: 10.0
 
 # the maximum allowed length for an input (prompt + response)
-max_length: 512
+max_length: 64
 
 # the maximum allowed length for a prompt
-max_prompt_length: 256
+max_prompt_length: 32
 
 # the number of epochs to train for; if null, must specify n_examples
 n_epochs: 1
@@ -89,13 +89,48 @@ warmup_steps: 150
 activation_checkpointing: false
 
 # evaluate and save model every eval_every steps
-eval_every: 100_000
+eval_every: 566
 
 # prevent wandb from logging more than once per minimum_log_interval_secs
 minimum_log_interval_secs: 1.0
 
+#dskd
+label_smoothing: 0.1
+kd_rate: 0.5
+kd_temperature: 1.0
+teacher_temperature: 1.0
+kd_objective: "forward_kl"  
+
+#dtw
+tis_dpo_rate: 1
+dtw_rate: 1
+dtw_gamma: 0.1
+dtw_gamma_start: 0.1 
+dtw_gamma_end: 0.8
+dtw_gamma_steps: 3570
+dtw_band_width: 5
+dtw_band_penalty: 1.0
+dtw_band_center_blend: 0.7
+dtw_band_entropy_coef: 2.0
+dtw_band_warmup_steps: 0
+kd_warmup_steps: 300
+dtw_warmup_steps: 0
+dtw_band_source: 'cma'
+
+#kd-tisdpo
+log_dir: null
+policy_mode: null
+reference_mode: null
+total_steps: 0
+scheduler: null
+
+#distiler
+gradient_checkpointing: false
+projector_config_path: /home/hungpv/projects/DSKD-DPO/config/projector_config.json
+projector_path: null
+
 defaults:
 - _self_
-- model: blank_model_fp32 # basic model configuration
-- loss: sft # which loss function, either sft or dpo (specify loss.beta if using dpo)
+- model: KD_tisdpo # basic model configuration
+- loss: KD_tisdpo # which loss function, either sft or dpo (specify loss.beta if using dpo)
 - transform: default # which transform configuration to use

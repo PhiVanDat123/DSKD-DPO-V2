@@ -29,6 +29,9 @@ from utils import (
     rank0_print,
     get_local_dir,
 )
+from criterions.dual_space_kd_with_cross_model_attention import DualSpaceKDWithCMA
+from distiller import Distiller
+from preference_datasets import DistillDPODataset, CustomCollate
 import numpy as np
 import wandb
 import tqdm
@@ -40,90 +43,8 @@ import time
 import json
 import functools
 from typing import Optional, Dict, List, Union, Tuple
-
-def _tdpo_get_batch_logps(logits: torch.FloatTensor, reference_logits: torch.FloatTensor, labels: torch.LongTensor,
-                          average_log_prob: bool = False):
-    """Compute the kl divergence/log probabilities of the given labels under the given logits.
-
-    Args:
-        logits: Logits of the model (unnormalized). Shape: (batch_size, sequence_length, vocab_size)
-        reference_logits: Logits of the reference model (unnormalized). Shape: (batch_size, sequence_length, vocab_size)
-        labels: Labels for which to compute the log probabilities. Label tokens with a value of -100 are ignored. Shape: (batch_size, sequence_length)
-        average_log_prob: If True, return the average log probability per (non-masked) token. Otherwise, return the sum of the log probabilities of the (non-masked) tokens.
-
-    Returns:
-        Several tensors of shape (batch_size,) containing the average/sum kl divergence/log probabilities of the given labels under the given logits.
-    """
-    assert logits.shape[:-1] == labels.shape
-    assert reference_logits.shape[:-1] == labels.shape
-
-    labels = labels[:, 1:].clone()
-    logits = logits[:, :-1, :]
-    reference_logits = reference_logits[:, :-1, :]
-
-    loss_mask = (labels != -100)
-
-    # dummy token; we'll ignore the losses on these tokens later
-    labels[labels == -100] = 0
-
-    vocab_logps = logits.log_softmax(-1)
-
-    reference_vocab_ps = reference_logits.softmax(-1)
-    reference_vocab_logps = reference_vocab_ps.log()
-
-    per_position_kl = (reference_vocab_ps * (reference_vocab_logps - vocab_logps)).sum(-1)
-    per_token_logps = torch.gather(vocab_logps, dim=2, index=labels.unsqueeze(2)).squeeze(2)
-    per_reference_token_logps = torch.gather(reference_vocab_logps, dim=2, index=labels.unsqueeze(2)).squeeze(2)
-
-    logps_margin = per_token_logps - per_reference_token_logps
-
-    if average_log_prob:
-        return (logps_margin * loss_mask).sum(-1) / loss_mask.sum(-1), \
-               (per_position_kl * loss_mask).sum(-1) / loss_mask.sum(-1), \
-               (per_token_logps * loss_mask).sum(-1) / loss_mask.sum(-1)
-    else:
-        return (logps_margin * loss_mask).sum(-1), \
-            (per_position_kl * loss_mask).sum(-1), \
-            (per_token_logps * loss_mask).sum(-1)
-
-
-def tdpo_loss(chosen_logps_margin: torch.FloatTensor,
-              rejected_logps_margin: torch.FloatTensor,
-              chosen_position_kl: torch.FloatTensor,
-              rejected_position_kl: torch.FloatTensor,
-              beta: float, alpha: float = 0.5, if_tdpo2: bool = True) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
-    """Compute the TDPO loss for a batch of policy and reference model log probabilities.
-
-    Args:
-        chosen_logps_margin: The difference of log probabilities between the policy model and the reference model for the chosen responses. Shape: (batch_size,)
-        rejected_logps_margin: The difference of log probabilities between the policy model and the reference model for the rejected responses. Shape: (batch_size,)
-        chosen_position_kl: The difference of sequential kl divergence between the policy model and the reference model for the chosen responses. Shape: (batch_size,)
-        rejected_position_kl: The difference of sequential kl divergence between the policy model and the reference model for the rejected responses. Shape: (batch_size,)
-        beta: Temperature parameter for the TDPO loss, typically something in the range of 0.1 to 0.5. We ignore the reference model as beta -> 0.
-        alpha: Temperature parameter for the TDPO loss, used to adjust the impact of sequential kl divergence.
-        if_tdpo2: Determine whether to use method TDPO2, default is True; if False, then use method TDPO1.
-
-    Returns:
-        A tuple of two tensors: (losses, rewards).
-        The losses tensor contains the TDPO loss for each example in the batch.
-        The rewards tensors contain the rewards for response pair.
-    """
-
-    chosen_values = chosen_logps_margin + chosen_position_kl
-    rejected_values = rejected_logps_margin + rejected_position_kl
-
-    chosen_rejected_logps_margin = chosen_logps_margin - rejected_logps_margin
-
-    if not if_tdpo2:
-        logits = chosen_rejected_logps_margin - (rejected_position_kl - chosen_position_kl)    # tdpo1
-    else:
-        logits = chosen_rejected_logps_margin - alpha * (rejected_position_kl - chosen_position_kl.detach())  # tdpo2
-    losses = -F.logsigmoid(beta * logits)
-
-    chosen_rewards = beta * chosen_values.detach()
-    rejected_rewards = beta * rejected_values.detach()
-
-    return losses, chosen_rewards, rejected_rewards
+from torch.utils.data import DataLoader
+from transformers import AutoTokenizer
 
 def tisdpo_loss(chosen_logps_margin: torch.FloatTensor,
                 rejected_logps_margin: torch.FloatTensor,
@@ -148,52 +69,6 @@ def tisdpo_loss(chosen_logps_margin: torch.FloatTensor,
 
     chosen_rewards = beta * chosen_values.detach()
     rejected_rewards = beta * rejected_values.detach()
-
-    return losses, chosen_rewards, rejected_rewards
-
-
-
-def preference_loss(policy_chosen_logps: torch.FloatTensor,
-                    policy_rejected_logps: torch.FloatTensor,
-                    reference_chosen_logps: torch.FloatTensor,
-                    reference_rejected_logps: torch.FloatTensor,
-                    beta: float,
-                    label_smoothing: float = 0.0,
-                    ipo: bool = False,
-                    reference_free: bool = False) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
-    """Compute the DPO loss for a batch of policy and reference model log probabilities.
-
-    Args:
-        policy_chosen_logps: Log probabilities of the policy model for the chosen responses. Shape: (batch_size,)
-        policy_rejected_logps: Log probabilities of the policy model for the rejected responses. Shape: (batch_size,)
-        reference_chosen_logps: Log probabilities of the reference model for the chosen responses. Shape: (batch_size,)
-        reference_rejected_logps: Log probabilities of the reference model for the rejected responses. Shape: (batch_size,)
-        beta: Temperature parameter for the DPO loss, typically something in the range of 0.1 to 0.5. We ignore the reference model as beta -> 0.
-        label_smoothing: conservativeness for DPO loss, which assumes that preferences are noisy (flipped with probability label_smoothing)
-        ipo: If True, use the IPO loss instead of the DPO loss.
-        reference_free: If True, we ignore the _provided_ reference model and implicitly use a reference model that assigns equal probability to all responses.
-
-    Returns:
-        A tuple of three tensors: (losses, chosen_rewards, rejected_rewards).
-        The losses tensor contains the DPO loss for each example in the batch.
-        The chosen_rewards and rejected_rewards tensors contain the rewards for the chosen and rejected responses, respectively.
-    """
-    pi_logratios = policy_chosen_logps - policy_rejected_logps
-    ref_logratios = reference_chosen_logps - reference_rejected_logps
-
-    if reference_free:
-        ref_logratios = 0
-
-    logits = pi_logratios - ref_logratios  # also known as h_{\pi_\theta}^{y_w,y_l}
-
-    if ipo:
-        losses = (logits - 1/(2 * beta)) ** 2  # Eq. 17 of https://arxiv.org/pdf/2310.12036v2.pdf
-    else:
-        # Eq. 3 https://ericmitchell.ai/cdpo.pdf; label_smoothing=0 gives original DPO (Eq. 7 of https://arxiv.org/pdf/2305.18290.pdf)
-        losses = -F.logsigmoid(beta * logits) * (1 - label_smoothing) - F.logsigmoid(-beta * logits) * label_smoothing
-
-    chosen_rewards = beta * (policy_chosen_logps - reference_chosen_logps).detach()
-    rejected_rewards = beta * (policy_rejected_logps - reference_rejected_logps).detach()
 
     return losses, chosen_rewards, rejected_rewards
 
@@ -261,12 +136,14 @@ def _get_batch_logps_tisdpo(logits: torch.FloatTensor, reference_logits: torch.F
 
     vocab_ps = logits.softmax(-1)
     vocab_logps = vocab_ps.log()
+    print(f"[DEBUG] vocab_logps.shape = {vocab_logps.shape}")
 
     reference_vocab_ps = reference_logits.softmax(-1)
     reference_vocab_logps = reference_vocab_ps.log()
 
     per_position_kl = (vocab_ps * (vocab_logps - reference_vocab_logps)).sum(-1)
 
+    labels = labels.long()
     per_token_logps = torch.gather(vocab_logps, dim=2, index=labels.unsqueeze(2)).squeeze(2)
     per_reference_token_logps = torch.gather(reference_vocab_logps, dim=2, index=labels.unsqueeze(2)).squeeze(2)
 
@@ -283,8 +160,7 @@ def _get_batch_logps_tisdpo(logits: torch.FloatTensor, reference_logits: torch.F
             (per_token_logps * weights * loss_mask).sum(-1)
 
 
-
-def concatenated_inputs(batch: Dict[str, Union[List, torch.LongTensor]]) -> Dict[str, torch.LongTensor]:
+def concatenated_inputs(batch: Dict[str, Union[List, torch.LongTensor]], mode: str) -> Dict[str, torch.LongTensor]:
     """Concatenate the chosen and rejected inputs into a single tensor.
     
     Args:
@@ -293,8 +169,17 @@ def concatenated_inputs(batch: Dict[str, Union[List, torch.LongTensor]]) -> Dict
     Returns:
         A dictionary containing the concatenated inputs under the key 'concatenated_input_ids'.
     """
-    max_length = max(batch['chosen_input_ids'].shape[1], batch['rejected_input_ids'].shape[1])
+    max_length = max(batch[f'chosen_{mode}_input_ids'].shape[1], batch[f'rejected_{mode}_input_ids'].shape[1])
     concatenated_batch = {}
+
+    print("[DEBUG] Batch keys:", batch.keys())
+    print("[DEBUG] Before concatenation:")
+    for k, v in batch.items():
+        print(k, type(v))
+        if isinstance(v, torch.Tensor):
+            print(v[:, :10])
+            print(f"  {k}.shape = {v.shape}, numel={v.numel()}, batch_size={v.shape[0]}")
+
     for k in batch:
         if k.startswith('chosen') and isinstance(batch[k], torch.Tensor):
             pad_value = -100 if 'labels' in k else 0
@@ -308,11 +193,17 @@ def concatenated_inputs(batch: Dict[str, Union[List, torch.LongTensor]]) -> Dict
                 concatenated_batch[concatenated_key],
                 pad_to_length(batch[k], max_length, pad_value=pad_value),
             ), dim=0)
+
+    # --- Debug print: kiểm tra batch size sau khi concat ---
+    for k, v in concatenated_batch.items():
+        print(f"[DEBUG] {k}.shape = {v.shape}, numel={v.numel()}, batch_size={v.shape[0]}")
+
     return concatenated_batch
 
 
+
 class BasicTrainer(object):
-    def __init__(self, policy: nn.Module, config: DictConfig, seed: int, run_dir: str, reference_model: Optional[nn.Module] = None, rank: int = 0, world_size: int = 1, transform_config = None):
+    def __init__(self, policy: nn.Module, config: DictConfig, seed: int, run_dir: str, reference_model: Optional[nn.Module] = None, rank: int = 0, world_size: int = 1):
         """A trainer for a language model, supporting either SFT or DPO training.
             
             If multiple GPUs are present, naively splits the model across them, effectively
@@ -324,80 +215,71 @@ class BasicTrainer(object):
         self.config = config
         self.run_dir = run_dir
         self.base_data_dir = config.base_data_dir
+        self.distiller = Distiller(config, device = self.rank)
+        self.DSKD = DualSpaceKDWithCMA(config, self.distiller, padding_id=-100)
 
-        tokenizer_name_or_path = config.model.tokenizer_name_or_path or config.model.name_or_path
-        rank0_print(f'Loading tokenizer {tokenizer_name_or_path}')
-        self.tokenizer = transformers.AutoTokenizer.from_pretrained(tokenizer_name_or_path)
-        if self.tokenizer.pad_token_id is None:
-            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
-        
-        data_iterator_kwargs = dict(
-            names=config.datasets,
-            tokenizer=self.tokenizer,
-            shuffle=True,
-            max_length=config.max_length,
-            max_prompt_length=config.max_prompt_length,
-            sft_mode=config.loss.name == 'sft',
-            seed=seed, 
-            reverse_dataset=config.reverse_dataset, 
-            base_data_dir=config.base_data_dir,
+        teacher_tokenizer_name_or_path = (
+            config.model.teacher_tokenizer_name_or_path or config.model.teacher_name_or_path
         )
+        rank0_print(f"Loading teacher tokenizer {teacher_tokenizer_name_or_path}")
+        self.teacher_tokenizer = AutoTokenizer.from_pretrained(teacher_tokenizer_name_or_path)
+        student_tokenizer_name_or_path = (
+            config.model.student_tokenizer_name_or_path or config.model.student_name_or_path
+        )
+        rank0_print(f"Loading student tokenizer {student_tokenizer_name_or_path}")
+        self.student_tokenizer = AutoTokenizer.from_pretrained(student_tokenizer_name_or_path)
+        if self.teacher_tokenizer.pad_token_id is None:
+            self.teacher_tokenizer.pad_token_id = self.teacher_tokenizer.eos_token_id
+            # self.teacher_tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+        if self.student_tokenizer.pad_token_id is None:
+            self.student_tokenizer.pad_token_id = self.student_tokenizer.eos_token_id
+            # self.student_tokenizer.add_special_tokens({"pad_token": "[PAD]"})
         
+        self.tokenizer = {
+            "teacher": self.teacher_tokenizer,
+            "student": self.student_tokenizer,
+        }
+
         self.policy = policy
         self.reference_model = reference_model
-        
-        # Use the passed transform_config if available
-        self.transform_config = transform_config
 
-        print(self.transform_config)
+        self.train_dataset = DistillDPODataset(
+            local_file_path = "/home/hungpv/projects/DSKD-DPO/generated-data/ultra-feedback-tisdpo/train_prefs.jsonl",
+            student_tokenizer = self.student_tokenizer,
+            teacher_tokenizer = self.teacher_tokenizer,
+        )
+        self.eval_dataset = DistillDPODataset(
+            local_file_path = "/home/hungpv/projects/DSKD-DPO/generated-data/ultra-feedback-tisdpo/test_prefs.jsonl",
+            student_tokenizer = self.student_tokenizer,
+            teacher_tokenizer = self.teacher_tokenizer,
+        )
         
-        self.train_iterator = get_batch_iterator(**data_iterator_kwargs, split='train', n_epochs=config.n_epochs, n_examples=config.n_examples, batch_size=config.batch_size, silent=rank != 0, transform_config=transform_config)
-        rank0_print(f'Loaded train data iterator')
-        self.eval_iterator = get_batch_iterator(**data_iterator_kwargs, split='test', n_examples=config.n_eval_examples, batch_size=config.eval_batch_size, silent=rank != 0, transform_config=transform_config)
+        self.train_iterator = DataLoader(
+            self.train_dataset,
+            batch_size=config.batch_size,
+            # batch_size=1,
+            shuffle=True,
+            collate_fn=CustomCollate(self.tokenizer),
+            pin_memory=True,
+            num_workers=2,
+            drop_last=True,
+        )
+        rank0_print("Loaded train data iterator")
+        # rank0_print("[DEBUG_TRAIN_ITER] Train iterator length:", self.train_iterator[0]['chosen_student_input_ids'].shape)
+
+        self.eval_iterator = DataLoader(
+            self.eval_dataset,
+            batch_size=config.eval_batch_size,
+            shuffle=True,
+            # collate_fn=get_collate_fn(self.tokenizer),
+            collate_fn=CustomCollate(self.tokenizer),
+            pin_memory=True,
+            num_workers=2,
+            drop_last=True,
+        )
         self.eval_batches = list(self.eval_iterator)
         rank0_print(f'Loaded {len(self.eval_batches)} eval batches of size {config.eval_batch_size}')
-
-    def get_batch_samples(self, batch: Dict[str, torch.LongTensor]) -> Tuple[str, str]:
-        """Generate samples from the policy (and reference model, if doing DPO training) for the given batch of inputs."""
-
-        # FSDP generation according to https://github.com/pytorch/pytorch/issues/100069
-        ctx = lambda: (FSDP.summon_full_params(self.policy, writeback=False, recurse=False) if 'FSDP' in self.config.trainer else contextlib.nullcontext())
-        with ctx():
-            policy_output = self.policy.generate(
-                batch['prompt_input_ids'], attention_mask=batch['prompt_attention_mask'], max_length=self.config.max_length, do_sample=True, pad_token_id=self.tokenizer.pad_token_id)
-
-        if self.config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo'}:
-            ctx = lambda: (FSDP.summon_full_params(self.reference_model, writeback=False, recurse=False) if 'FSDP' in self.config.trainer else contextlib.nullcontext())
-            with ctx():
-                reference_output = self.reference_model.generate(
-                    batch['prompt_input_ids'], attention_mask=batch['prompt_attention_mask'], max_length=self.config.max_length, do_sample=True, pad_token_id=self.tokenizer.pad_token_id)
-
-        policy_output = pad_to_length(policy_output, self.config.max_length, self.tokenizer.pad_token_id)
-        policy_output = all_gather_if_needed(policy_output, self.rank, self.world_size)
-        policy_output_decoded = self.tokenizer.batch_decode(policy_output, skip_special_tokens=True)
-
-        if self.config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo'}:
-            reference_output = pad_to_length(reference_output, self.config.max_length, self.tokenizer.pad_token_id)
-            reference_output = all_gather_if_needed(reference_output, self.rank, self.world_size)
-            reference_output_decoded = self.tokenizer.batch_decode(reference_output, skip_special_tokens=True)
-        else:
-            reference_output_decoded = []
-
-        return policy_output_decoded, reference_output_decoded
     
-    def concatenated_forward(self, model: nn.Module, batch: Dict[str, Union[List, torch.LongTensor]]) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
-        """Run the given model on the given batch of inputs, concatenating the chosen and rejected inputs together.
-        
-           We do this to avoid doing two forward passes, because it's faster for FSDP.
-        """
-
-        concatenated_batch = concatenated_inputs(batch)
-        # dict_keys(['concatenated_weight', 'concatenated_input_ids', 'concatenated_attention_mask', 'concatenated_labels'])
-        all_logits = model(concatenated_batch['concatenated_input_ids'], attention_mask=concatenated_batch['concatenated_attention_mask']).logits.to(torch.float32)
-        all_logps = _get_batch_logps(all_logits, concatenated_batch['concatenated_labels'], concatenated_batch['concatenated_weight'], average_log_prob=False, token_level=self.config.loss.token_level)
-        chosen_logps = all_logps[:batch['chosen_input_ids'].shape[0]]
-        rejected_logps = all_logps[batch['chosen_input_ids'].shape[0]:]
-        return chosen_logps, rejected_logps
     
     def tisdpo_concatenated_forward(self, model: nn.Module, reference_model: nn.Module,
                                   batch: Dict[str, Union[List, torch.LongTensor]]):
@@ -405,51 +287,29 @@ class BasicTrainer(object):
 
            We do this to avoid doing two forward passes, because it's faster for FSDP.
         """
-        concatenated_batch = concatenated_inputs(batch)
-        all_logits = model(concatenated_batch['concatenated_input_ids'],
-                           attention_mask=concatenated_batch['concatenated_attention_mask']).logits.to(torch.float32)
+        # print("[DEBUG_INSIDE_TISDPO] Batch keys:", batch.keys())
+        print("[DEBUG_INSIDE_TISDPO] Batch size:", batch['chosen_student_input_ids'].shape)
+        concatenated_batch_student = concatenated_inputs(batch, 'student')
+        concatenated_batch_teacher = concatenated_inputs(batch, 'teacher')
+        all_logits = model(concatenated_batch_student['concatenated_student_input_ids'],
+                           attention_mask=concatenated_batch_student['concatenated_student_attention_mask']).logits.to(torch.float32)
         
+        '''
         with torch.no_grad():
             reference_all_logits = reference_model(concatenated_batch['concatenated_input_ids'],
                                                    attention_mask=concatenated_batch[
                                                        'concatenated_attention_mask']).logits.to(torch.float32)
-        
-        all_logps_margin, all_position_kl, all_logps = _get_batch_logps_tisdpo(all_logits, reference_all_logits, concatenated_batch['concatenated_labels'], concatenated_batch['concatenated_weight'], average_log_prob=False)
+        '''
+        reference_all_logits = self.DSKD.compute_t2s_logits(concatenated_batch_teacher, self.distiller, self.policy, self.reference_model)
+        all_logps_margin, all_position_kl, all_logps = _get_batch_logps_tisdpo(all_logits, reference_all_logits, concatenated_batch_teacher['concatenated_teacher_labels'], concatenated_batch_teacher['concatenated_teacher_weight'], average_log_prob=False)
 
-        chosen_logps_margin = all_logps_margin[:batch['chosen_input_ids'].shape[0]]
-        rejected_logps_margin = all_logps_margin[batch['chosen_input_ids'].shape[0]:]
-        chosen_position_kl = all_position_kl[:batch['chosen_input_ids'].shape[0]]
-        rejected_position_kl = all_position_kl[batch['chosen_input_ids'].shape[0]:]
+        chosen_logps_margin = all_logps_margin[:batch['chosen_student_input_ids'].shape[0]]
+        rejected_logps_margin = all_logps_margin[batch['chosen_student_input_ids'].shape[0]:]
+        chosen_position_kl = all_position_kl[:batch['chosen_student_input_ids'].shape[0]]
+        rejected_position_kl = all_position_kl[batch['chosen_student_input_ids'].shape[0]:]
 
-        chosen_logps = all_logps[:batch['chosen_input_ids'].shape[0]].detach()
-        rejected_logps = all_logps[batch['chosen_input_ids'].shape[0]:].detach()
-
-        return chosen_logps_margin, rejected_logps_margin, chosen_position_kl, rejected_position_kl, \
-            chosen_logps, rejected_logps
-    
-    def tdpo_concatenated_forward(self, model: nn.Module, reference_model: nn.Module,
-                                  batch: Dict[str, Union[List, torch.LongTensor]]):
-        """Run the policy model and the reference model on the given batch of inputs, concatenating the chosen and rejected inputs together.
-
-           We do this to avoid doing two forward passes, because it's faster for FSDP.
-        """
-        concatenated_batch = concatenated_inputs(batch)
-        all_logits = model(concatenated_batch['concatenated_input_ids'],
-                           attention_mask=concatenated_batch['concatenated_attention_mask']).logits.to(torch.float32)
-        
-        with torch.no_grad():
-            reference_all_logits = reference_model(concatenated_batch['concatenated_input_ids'],
-                                                   attention_mask=concatenated_batch[
-                                                       'concatenated_attention_mask']).logits.to(torch.float32)
-        all_logps_margin, all_position_kl, all_logps = _tdpo_get_batch_logps(all_logits, reference_all_logits, concatenated_batch['concatenated_labels'], average_log_prob=False)
-
-        chosen_logps_margin = all_logps_margin[:batch['chosen_input_ids'].shape[0]]
-        rejected_logps_margin = all_logps_margin[batch['chosen_input_ids'].shape[0]:]
-        chosen_position_kl = all_position_kl[:batch['chosen_input_ids'].shape[0]]
-        rejected_position_kl = all_position_kl[batch['chosen_input_ids'].shape[0]:]
-
-        chosen_logps = all_logps[:batch['chosen_input_ids'].shape[0]].detach()
-        rejected_logps = all_logps[batch['chosen_input_ids'].shape[0]:].detach()
+        chosen_logps = all_logps[:batch['chosen_student_input_ids'].shape[0]].detach()
+        rejected_logps = all_logps[batch['chosen_student_input_ids'].shape[0]:].detach()
 
         return chosen_logps_margin, rejected_logps_margin, chosen_position_kl, rejected_position_kl, \
             chosen_logps, rejected_logps
@@ -458,71 +318,18 @@ class BasicTrainer(object):
     def get_batch_metrics(self, batch: Dict[str, Union[List, torch.LongTensor]], loss_config: DictConfig, train=True):
         """Compute the SFT or DPO loss and other metrics for the given batch of inputs."""
 
+        print("[DEBUG_GET_BATCH_METRICS] Batch size:", batch['chosen_student_input_ids'].shape)
         metrics = {}
         train_test = 'train' if train else 'eval'
 
-        if loss_config.name in {'dpo', 'ipo'}:
-            policy_chosen_logps, policy_rejected_logps = self.concatenated_forward(self.policy, batch)
-            with torch.no_grad():
-                reference_chosen_logps, reference_rejected_logps = self.concatenated_forward(self.reference_model, batch)
-
-            if loss_config.name == 'dpo':
-                loss_kwargs = {'beta': loss_config.beta, 'reference_free': loss_config.reference_free, 'label_smoothing': loss_config.label_smoothing, 'ipo': False}
-            elif loss_config.name == 'ipo':
-                loss_kwargs = {'beta': loss_config.beta, 'ipo': True}
-            else:
-                raise ValueError(f'unknown loss {loss_config.name}')
-
-            losses, chosen_rewards, rejected_rewards = preference_loss(
-                policy_chosen_logps, policy_rejected_logps, reference_chosen_logps, reference_rejected_logps, **loss_kwargs)
-
-            reward_accuracies = (chosen_rewards > rejected_rewards).float()
-
-            chosen_rewards = all_gather_if_needed(chosen_rewards, self.rank, self.world_size)
-            rejected_rewards = all_gather_if_needed(rejected_rewards, self.rank, self.world_size)
-            reward_accuracies = all_gather_if_needed(reward_accuracies, self.rank, self.world_size)
-
-            metrics[f'rewards_{train_test}/chosen'] = chosen_rewards.cpu().numpy().tolist()
-            metrics[f'rewards_{train_test}/rejected'] = rejected_rewards.cpu().numpy().tolist()
-            metrics[f'rewards_{train_test}/accuracies'] = reward_accuracies.cpu().numpy().tolist()
-            metrics[f'rewards_{train_test}/margins'] = (chosen_rewards - rejected_rewards).cpu().numpy().tolist()
-
-            policy_rejected_logps = all_gather_if_needed(policy_rejected_logps.detach(), self.rank, self.world_size)
-            metrics[f'logps_{train_test}/rejected'] = policy_rejected_logps.cpu().numpy().tolist()
-        elif loss_config.name == 'tdpo':
-            chosen_logps_margin, rejected_logps_margin, chosen_position_kl, rejected_position_kl, policy_chosen_logps, policy_rejected_logps\
-                = self.tdpo_concatenated_forward(self.policy, self.reference_model, batch)
-            losses, chosen_rewards, rejected_rewards = tdpo_loss(chosen_logps_margin, rejected_logps_margin,
-                                                                 chosen_position_kl, rejected_position_kl,
-                                                                 beta=loss_config.beta, alpha=loss_config.alpha, if_tdpo2=loss_config.if_tdpo2)
-
-            reward_accuracies = (chosen_rewards > rejected_rewards).float()
-
-            chosen_rewards = all_gather_if_needed(chosen_rewards, self.rank, self.world_size)
-            rejected_rewards = all_gather_if_needed(rejected_rewards, self.rank, self.world_size)
-            reward_accuracies = all_gather_if_needed(reward_accuracies, self.rank, self.world_size)
-
-            metrics[f'rewards_{train_test}/chosen'] = chosen_rewards.cpu().numpy().tolist()
-            metrics[f'rewards_{train_test}/rejected'] = rejected_rewards.cpu().numpy().tolist()
-            metrics[f'rewards_{train_test}/accuracies'] = reward_accuracies.cpu().numpy().tolist()
-            metrics[f'rewards_{train_test}/margins'] = (chosen_rewards - rejected_rewards).cpu().numpy().tolist()
-
-            all_device_chosen_position_kl = all_gather_if_needed(chosen_position_kl.detach(), self.rank, self.world_size)
-            all_device_rejected_position_kl = all_gather_if_needed(rejected_position_kl.detach(), self.rank, self.world_size)
-
-            metrics[f'kl_{train_test}/chosen'] = all_device_chosen_position_kl.cpu().numpy().tolist()
-            metrics[f'kl_{train_test}/rejected'] = all_device_rejected_position_kl.cpu().numpy().tolist()
-            metrics[f'kl_{train_test}/margin'] = (all_device_chosen_position_kl - all_device_rejected_position_kl).cpu().numpy().tolist()
-
-            policy_rejected_logps = all_gather_if_needed(policy_rejected_logps.detach(), self.rank, self.world_size)
-            metrics[f'logps_{train_test}/rejected'] = policy_rejected_logps.cpu().numpy().tolist()
-        elif loss_config.name == 'tisdpo':
+        if loss_config.name == 'KD_tisdpo':
             chosen_logps_margin, rejected_logps_margin, chosen_position_kl, rejected_position_kl, policy_chosen_logps, policy_rejected_logps\
                 = self.tisdpo_concatenated_forward(self.policy, self.reference_model, batch)
-            losses, chosen_rewards, rejected_rewards = tisdpo_loss(chosen_logps_margin, rejected_logps_margin,
+            loss_tisdpo, chosen_rewards, rejected_rewards = tisdpo_loss(chosen_logps_margin, rejected_logps_margin,
                                                                  chosen_position_kl, rejected_position_kl,
                                                                  beta=loss_config.beta, alpha=loss_config.alpha, token_level=loss_config.token_level)
-
+            loss_dtw = self.DSKD.compute_dtw_loss(batch, self.distiller, self.policy, self.reference_model)
+            losses = self.config.tis_dpo_rate * loss_tisdpo + self.config.dtw_rate * loss_dtw
             reward_accuracies = (chosen_rewards > rejected_rewards).float()
 
             chosen_rewards = all_gather_if_needed(chosen_rewards, self.rank, self.world_size)
@@ -569,7 +376,7 @@ class BasicTrainer(object):
         np.random.seed(self.seed)
         random.seed(self.seed)
 
-        if self.config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo'}:
+        if self.config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo', 'KD_tisdpo'}:
             self.reference_model.eval()
 
         self.example_counter = 0
@@ -586,10 +393,11 @@ class BasicTrainer(object):
                 if self.config.sample_during_eval:
                     all_policy_samples, all_reference_samples = [], []
                     policy_text_table = wandb.Table(columns=["step", "prompt", "sample"])
-                    if self.config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo'}:
+                    if self.config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo', 'KD_tisdpo'}:
                         reference_text_table = wandb.Table(columns=["step", "prompt", "sample"])
 
                 for eval_batch in (tqdm.tqdm(self.eval_batches, desc='Computing eval metrics') if self.rank == 0 else self.eval_batches):
+                    print("[DEBUG_EVAL] Eval batch size:", eval_batch['chosen_student_input_ids'].shape)
                     local_eval_batch = slice_and_move_batch_for_device(eval_batch, self.rank, self.world_size, self.rank)
                     with torch.no_grad():
                         _, eval_metrics = self.get_batch_metrics(local_eval_batch, self.config.loss, train=False)
@@ -613,7 +421,7 @@ class BasicTrainer(object):
 
                         for prompt, sample in zip(eval_batch['prompt'], policy_samples):
                             policy_text_table.add_data(self.example_counter, prompt, sample)
-                        if self.config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo'}:
+                        if self.config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo', 'KD_tisdpo'}:
                             for prompt, sample in zip(eval_batch['prompt'], reference_samples):
                                 reference_text_table.add_data(self.example_counter, prompt, sample)
 
@@ -621,7 +429,7 @@ class BasicTrainer(object):
                 rank0_print(f'eval after {self.example_counter}: {formatted_dict(mean_eval_metrics)}')
                 if self.config.sample_during_eval:                    
                     rank0_print(json.dumps(all_policy_samples[:10], indent=2))
-                    if self.config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo'}:
+                    if self.config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo', 'KD_tisdpo'}:
                         rank0_print(json.dumps(all_reference_samples[:10], indent=2))
 
                 if self.config.wandb.enabled and self.rank == 0:
@@ -629,7 +437,7 @@ class BasicTrainer(object):
 
                     if self.config.sample_during_eval:
                         wandb.log({"policy_samples": policy_text_table}, step=self.example_counter)
-                        if self.config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo'}:
+                        if self.config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo', 'KD_tisdpo'}:
                             wandb.log({"reference_samples": reference_text_table}, step=self.example_counter)
 
             #### END EVALUATION ####
@@ -640,10 +448,14 @@ class BasicTrainer(object):
             start_time = time.time()
             batch_metrics = defaultdict(list)
             for microbatch_idx in range(self.config.gradient_accumulation_steps):
+                print("[DEBUG_TRAIN] Batch size:", batch['chosen_student_input_ids'].shape)
                 global_microbatch = slice_and_move_batch_for_device(batch, microbatch_idx, self.config.gradient_accumulation_steps, self.rank)
+                print("[DEBUG_TRAIN] Global microbatch size:", global_microbatch['chosen_student_input_ids'].shape)
                 local_microbatch = slice_and_move_batch_for_device(global_microbatch, self.rank, self.world_size, self.rank)
+                print("[DEBUG_TRAIN] Local microbatch size:", local_microbatch['chosen_student_input_ids'].shape)
                 loss, metrics = self.get_batch_metrics(local_microbatch, self.config.loss, train=True)
                 (loss / self.config.gradient_accumulation_steps).backward()
+                break 
 
                 for k, v in metrics.items():
                     batch_metrics[k].extend(v)
@@ -708,7 +520,7 @@ class BasicTrainer(object):
         rank0_print(f"Model saved to {model_save_dir} using save_pretrained")
         
         # Save tokenizer alongside the model
-        self.tokenizer.save_pretrained(model_save_dir)
+        self.student_tokenizer.save_pretrained(model_save_dir)
         
         # Save metrics separately
         if metrics is not None:
@@ -718,17 +530,17 @@ class BasicTrainer(object):
 
 
 class FSDPTrainer(BasicTrainer):
-    def __init__(self, policy: nn.Module, config: DictConfig, seed: int, run_dir: str, reference_model: Optional[nn.Module] = None, rank: int = 0, world_size: int = 1, transform_config = None):
+    def __init__(self, policy: nn.Module, config: DictConfig, seed: int, run_dir: str, reference_model: Optional[nn.Module] = None, rank: int = 0, world_size: int = 1):
         """A trainer subclass that uses PyTorch FSDP to shard the model across multiple GPUs.
         
            This trainer will shard both the policy and reference model across all available GPUs.
            Models are sharded at the block level, where the block class name is provided in the config.
         """
 
-        super().__init__(policy, config, seed, run_dir, reference_model, rank, world_size, transform_config=transform_config)
-        assert config.model.block_name is not None, 'must specify model.block_name (e.g., GPT2Block or GPTNeoXLayer) for FSDP'
+        super().__init__(policy, config, seed, run_dir, reference_model, rank, world_size)
+        assert config.model.policy_block_name is not None, 'must specify model.block_name (e.g., GPT2Block or GPTNeoXLayer) for FSDP'
 
-        wrap_class = get_block_class_from_model(policy, config.model.block_name)
+        wrap_class = get_block_class_from_model(policy, config.model.policy_block_name)
         model_auto_wrap_policy = functools.partial(transformer_auto_wrap_policy, transformer_layer_cls={wrap_class},)
 
         shared_fsdp_kwargs = dict(
@@ -773,7 +585,7 @@ class FSDPTrainer(BasicTrainer):
                 apply_activation_checkpointing(self.policy, checkpoint_wrapper_fn=non_reentrant_wrapper, check_fn=check_fn)
                 rank0_print('FSDP activation checkpointing enabled!')
 
-        if config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo'}:
+        if config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo', 'KD_tisdpo'}:
             rank0_print('Sharding reference model...')
             self.reference_model = FSDP(reference_model, **shared_fsdp_kwargs)
         
@@ -801,7 +613,7 @@ class FSDPTrainer(BasicTrainer):
             
             # Get the original model class and instantiate it directly
             from transformers import AutoModelForCausalLM
-            model_name = self.config.model.name_or_path
+            model_name = self.config.model.policy_name_or_path
             unwrapped_model = AutoModelForCausalLM.from_pretrained(model_name)
             unwrapped_model.load_state_dict(policy_state_dict)
             
@@ -811,7 +623,7 @@ class FSDPTrainer(BasicTrainer):
             del unwrapped_model
             
             # Save tokenizer alongside the model
-            self.tokenizer.save_pretrained(model_save_dir)
+            self.student_tokenizer.save_pretrained(model_save_dir)
             
             # Save metrics separately
             if metrics is not None:
@@ -821,55 +633,4 @@ class FSDPTrainer(BasicTrainer):
             
         del policy_state_dict
         dist.barrier()
-
-
-class TensorParallelTrainer(BasicTrainer):
-    def __init__(self, policy, config, seed, run_dir, reference_model=None, rank=0, world_size=1, transform_config=None):
-        """A trainer subclass that uses TensorParallel to shard the model across multiple GPUs.
-
-           Based on https://github.com/BlackSamorez/tensor_parallel. Note sampling is extremely slow,
-              see https://github.com/BlackSamorez/tensor_parallel/issues/66.
-        """
-        super().__init__(policy, config, seed, run_dir, reference_model, rank, world_size, transform_config=transform_config)
-        
-        rank0_print('Sharding policy...')
-        self.policy = tp.tensor_parallel(policy, sharded=True)
-        if config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo'}:
-            rank0_print('Sharding reference model...')
-            self.reference_model = tp.tensor_parallel(reference_model, sharded=False)
-
-    def save(self, output_dir=None, metrics=None):
-        """Save (unsharded) policy state to disk."""
-        with tp.save_tensor_parallel(self.policy):
-            policy_state_dict = self.policy.state_dict()
-    
-        # Save model using transformers save_pretrained
-        if output_dir is None:
-            model_save_dir = os.path.join(self.run_dir, f'LATEST')
-        else:
-            model_save_dir = output_dir
-            
-        os.makedirs(model_save_dir, exist_ok=True)
-            
-        # Get the original model class and instantiate it directly
-        from transformers import AutoModelForCausalLM
-        model_name = self.config.model.name_or_path
-        unwrapped_model = AutoModelForCausalLM.from_pretrained(model_name)
-        unwrapped_model.load_state_dict(policy_state_dict)
-        
-        # Save using transformers save_pretrained
-        unwrapped_model.save_pretrained(model_save_dir)
-        rank0_print(f"Model saved to {model_save_dir} using save_pretrained")
-        del unwrapped_model
-            
-        # Save tokenizer alongside the model
-        self.tokenizer.save_pretrained(model_save_dir)
-            
-        # Save metrics separately
-        if metrics is not None:
-            metrics_file = os.path.join(model_save_dir, "training_metrics.json")
-            with open(metrics_file, "w") as f:
-                json.dump({"step": self.example_counter, "metrics": metrics}, f)
-        
-        del policy_state_dict
         

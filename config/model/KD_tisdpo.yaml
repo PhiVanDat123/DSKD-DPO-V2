@@ -1,0 +1,19 @@
+reference_name_or_path: null
+policy_name_or_path: null
+teacher_name_or_path: null
+student_name_or_path: null
+original_policy_name: null
+
+teacher_tokenizer_name_or_path: null
+student_tokenizer_name_or_path: null
+
+policy_block_name: null
+reference_block_name: null
+
+model_type: llama
+teacher_model_type: qwen
+
+policy_dtype: float32
+reference_dtype: float32
+teacher_dtype: float32
+fsdp_policy_mp: null
