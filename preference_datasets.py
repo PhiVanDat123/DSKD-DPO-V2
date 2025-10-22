@@ -515,7 +515,7 @@ class CustomCollate:
 
 
 class DistillDPODataset(Dataset):
-    def __init__(self, local_file_path, student_tokenizer, teacher_tokenizer, max_length=64, max_prompt_length=32):
+    def __init__(self, local_file_path, student_tokenizer, teacher_tokenizer, max_length=1024, max_prompt_length=512):
         self.student_tokenizer = student_tokenizer
         self.teacher_tokenizer = teacher_tokenizer
         self.max_length = max_length

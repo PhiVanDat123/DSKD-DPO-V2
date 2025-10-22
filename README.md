@@ -40,16 +40,16 @@ Our approach assigns importance weights to each token based on its estimated rew
 Create and activate the conda environment:
 
 ```bash
-conda env create -f environment.yml
-conda activate tis-dpo
+conda env create -f environment.yaml
+conda activate dskd-dpo
 ```
 
 ## 📊 Dataset Preparation
 
-Download the required dataset from [Hugging Face](https://huggingface.co/datasets/exlaw/tis-dpo-data):
+Download the required dataset from [Hugging Face](https://huggingface.co/datasets/HuggingFaceH4/ultrafeedback_binarized):
 
 ```bash
-huggingface-cli download --resume-download exlaw/tis-dpo-data --local-dir datasets --repo-type=dataset
+huggingface-cli download --resume-download HuggingFaceH4/ultrafeedback_binarized --local-dir datasets --repo-type=dataset
 ```
 
 The data should be organized in the `datasets/` directory.
