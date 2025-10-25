@@ -169,7 +169,8 @@ def concatenated_inputs(batch: Dict[str, Union[List, torch.LongTensor]], mode: s
     Returns:
         A dictionary containing the concatenated inputs under the key 'concatenated_input_ids'.
     """
-    max_length = max(batch[f'chosen_{mode}_input_ids'].shape[1], batch[f'rejected_{mode}_input_ids'].shape[1])
+    #max_length = max(batch[f'chosen_{mode}_input_ids'].shape[1], batch[f'rejected_{mode}_input_ids'].shape[1])
+    max_length = max(v.shape[1] for v in batch.values() if isinstance(v, torch.Tensor) and v.ndim == 2)
     concatenated_batch = {}
 
     print("[DEBUG] Batch keys:", batch.keys())

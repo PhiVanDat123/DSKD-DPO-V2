@@ -8,6 +8,7 @@ import torch.distributed as dist
 import inspect
 import importlib.util
 import socket
+import torch.nn.functional as F
 from typing import Dict, Union, Type, List
 
 import time
@@ -125,6 +126,7 @@ def slice_and_move_batch_for_device(batch: Dict, rank: int, world_size: int, dev
     print("[DEBUG_SLICE_AND_MOVE_BATCH_FOR_DEVICE] After slice and move batch size:", size_after, "rank:", rank)
     return on_device
 
+'''
 def pad_to_length(tensor: torch.Tensor, length: int, pad_value: Union[int, float], dim: int = -1) -> torch.Tensor:
     if tensor.size(dim) >= length:
         return tensor
@@ -132,7 +134,17 @@ def pad_to_length(tensor: torch.Tensor, length: int, pad_value: Union[int, float
         pad_size = list(tensor.shape)
         pad_size[dim] = length - tensor.size(dim)
         return torch.cat([tensor, pad_value * torch.ones(*pad_size, dtype=tensor.dtype, device=tensor.device)], dim=dim)
+'''
 
+
+def pad_to_length(tensor: torch.Tensor, length: int, pad_value: Union[int, float], dim: int = -1) -> torch.Tensor:
+    pad_len = length - tensor.size(dim)
+    if pad_len <= 0:
+        return tensor
+    # F.pad expects (pad_left, pad_right, pad_top, pad_bottom, ...)
+    pad_config = [0, 0] * tensor.dim()
+    pad_config[-1] = pad_len  # pad only at the end of the last dimension
+    return F.pad(tensor, (0, pad_len), value=pad_value)
 
 def all_gather_if_needed(values: torch.Tensor, rank: int, world_size: int) -> torch.Tensor:
     """Gather and stack/cat values from all processes, if there are multiple processes."""
