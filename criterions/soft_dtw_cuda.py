@@ -18,29 +18,34 @@ import math
 @cuda.jit
 def compute_softdtw_cuda(D, gamma, bandwidth, max_i, max_j, n_passes, R):
     """
-    CUDA diagonal implementation. Each block processes one sample (pair).
-    Threads per block correspond to max diagonal length (we cap this in Python launcher).
+    CUDA diagonal implementation (stride-based).
+    Each block processes one sample (pair). Threads in the block cover I indices
+    with a stride equal to blockDim.x so we don't require threads_per_block >= max diagonal length.
+    Args kept same as original: max_i (N), max_j (M), n_passes (should be N+M-1).
     """
     b = cuda.blockIdx.x
     tid = cuda.threadIdx.x
-    I = tid
+    stride = cuda.blockDim.x
     inv_gamma = 1.0 / gamma
 
     for p in range(n_passes):
-        J = max(0, min(p - tid, max_j - 1))
-        i = I + 1
-        j = J + 1
-
-        if I + J == p and (I < max_i and J < max_j):
-            if not (abs(i - j) > bandwidth > 0):
-                r0 = -R[b, i - 1, j - 1] * inv_gamma
-                r1 = -R[b, i - 1, j] * inv_gamma
-                r2 = -R[b, i, j - 1] * inv_gamma
-                rmax = max(max(r0, r1), r2)
-                rsum = math.exp(r0 - rmax) + math.exp(r1 - rmax) + math.exp(r2 - rmax)
-                softmin = -gamma * (math.log(rsum) + rmax)
-                R[b, i, j] = D[b, i - 1, j - 1] + softmin
-
+        I = tid
+        # Each thread handles multiple I values separated by 'stride'
+        while I < max_i:
+            J = p - I
+            if 0 <= J < max_j:
+                i = I + 1
+                j = J + 1
+                if not (abs(i - j) > bandwidth > 0):
+                    r0 = -R[b, i - 1, j - 1] * inv_gamma
+                    r1 = -R[b, i - 1, j] * inv_gamma
+                    r2 = -R[b, i, j - 1] * inv_gamma
+                    # numerically stable soft-min
+                    rmax = max(max(r0, r1), r2)
+                    rsum = math.exp(r0 - rmax) + math.exp(r1 - rmax) + math.exp(r2 - rmax)
+                    softmin = -gamma * (math.log(rsum) + rmax)
+                    R[b, i, j] = D[b, i - 1, j - 1] + softmin
+            I += stride
         cuda.syncthreads()
 
 # ----------------------------------------------------------------------------------------------------------------------
@@ -48,27 +53,30 @@ def compute_softdtw_cuda(D, gamma, bandwidth, max_i, max_j, n_passes, R):
 def compute_softdtw_backward_cuda(D, R, inv_gamma, bandwidth, max_i, max_j, n_passes, E):
     """
     Backward pass on CUDA, following the anti-diagonals in reverse.
+    Stride-based similar to forward kernel.
     """
     k = cuda.blockIdx.x
     tid = cuda.threadIdx.x
-    I = tid
+    stride = cuda.blockDim.x
 
     for p in range(n_passes):
         rev_p = n_passes - p - 1
-        J = max(0, min(rev_p - tid, max_j - 1))
-        i = I + 1
-        j = J + 1
+        I = tid
+        while I < max_i:
+            J = rev_p - I
+            if 0 <= J < max_j:
+                i = I + 1
+                j = J + 1
 
-        if I + J == rev_p and (I < max_i and J < max_j):
-            if math.isinf(R[k, i, j]):
-                R[k, i, j] = -math.inf
+                if math.isinf(R[k, i, j]):
+                    R[k, i, j] = -math.inf
 
-            if not (abs(i - j) > bandwidth > 0):
-                a = math.exp((R[k, i + 1, j] - R[k, i, j] - D[k, i + 1, j]) * inv_gamma)
-                b = math.exp((R[k, i, j + 1] - R[k, i, j] - D[k, i, j + 1]) * inv_gamma)
-                c = math.exp((R[k, i + 1, j + 1] - R[k, i, j] - D[k, i + 1, j + 1]) * inv_gamma)
-                E[k, i, j] = E[k, i + 1, j] * a + E[k, i, j + 1] * b + E[k, i + 1, j + 1] * c
-
+                if not (abs(i - j) > bandwidth > 0):
+                    a = math.exp((R[k, i + 1, j] - R[k, i, j] - D[k, i + 1, j]) * inv_gamma)
+                    b = math.exp((R[k, i, j + 1] - R[k, i, j] - D[k, i, j + 1]) * inv_gamma)
+                    c = math.exp((R[k, i + 1, j + 1] - R[k, i, j] - D[k, i + 1, j + 1]) * inv_gamma)
+                    E[k, i, j] = E[k, i + 1, j] * a + E[k, i, j + 1] * b + E[k, i + 1, j + 1] * c
+            I += stride
         cuda.syncthreads()
 
 # ----------------------------------------------------------------------------------------------------------------------
@@ -100,11 +108,14 @@ class _SoftDTWCUDA(Function):
         else:
             max_threads = 1024
 
-        threads_per_block = int(min(max(N, M), max_threads))
+        # Use a safe cap so kernel doesn't demand enormous single-block threads.
+        SAFE_THREAD_CAP = min(max_threads, 256)
+        threads_per_block = int(min(max(N, M), SAFE_THREAD_CAP)) if SAFE_THREAD_CAP > 0 else 1
         if threads_per_block <= 0:
             raise RuntimeError(f"Invalid threads_per_block computed: {threads_per_block}")
 
-        n_passes = 2 * threads_per_block - 1
+        # Number of anti-diagonals
+        n_passes = N + M - 1
 
         # Prepare R buffer (float32 for CUDA kernel)
         R = torch.ones((B, N + 2, M + 2), device=dev, dtype=torch.float32) * math.inf
@@ -113,14 +124,10 @@ class _SoftDTWCUDA(Function):
         # Convert D to float32 for kernel (kernel expects float32 arrays)
         D_cuda = D.detach().to(torch.float32)
 
-        # Launch the kernel. If threads_per_block is lower than max diagonal length (because we capped),
-        # the kernel still runs but will only use `threads_per_block` threads: This means we must ensure
-        # max(N,M) <= threads_per_block in normal designs. To be safe, we print a warning when capping happens.
-        if max(N, M) > max_threads:
-            # If sequence length exceeds capability, safer to raise or let caller fallback.
-            # Here we still attempt launch (but it's likely incorrect if algorithm assumed full diagonal threads).
-            print(f"[SoftDTW] Warning: sequence length {max(N,M)} > device max_threads_per_block {max_threads}. "
-                  "Consider using CPU fallback or tile-based CUDA implementation.")
+        # If original sequence length is larger than SAFE_THREAD_CAP, that's fine because kernel is stride-based.
+        if max(N, M) > SAFE_THREAD_CAP:
+            print(f"[SoftDTW] Note: sequence length {max(N,M)} > safe thread cap {SAFE_THREAD_CAP}. "
+                  "Kernel will use stride-based coverage across diagonals (safe).")
 
         # Perform kernel launch
         compute_softdtw_cuda[B, threads_per_block](
@@ -161,10 +168,12 @@ class _SoftDTWCUDA(Function):
         else:
             max_threads = 1024
 
-        threads_per_block = int(min(max(N, M), max_threads))
+        SAFE_THREAD_CAP = min(max_threads, 256)
+        threads_per_block = int(min(max(N, M), SAFE_THREAD_CAP)) if SAFE_THREAD_CAP > 0 else 1
         if threads_per_block <= 0:
             raise RuntimeError(f"Invalid threads_per_block computed in backward: {threads_per_block}")
-        n_passes = 2 * threads_per_block - 1
+
+        n_passes = N + M - 1
 
         # Prepare D_, R_local, E buffers for backward kernel
         D_ = torch.zeros((B, N + 2, M + 2), dtype=torch.float32, device=dev)
@@ -443,4 +452,5 @@ if __name__ == "__main__":
     profile(128, 17, 15, 2, tol_backward=1e-6)
     profile(512, 64, 64, 2, tol_backward=1e-4)
     profile(512, 256, 256, 2, tol_backward=1e-3)
+
 
