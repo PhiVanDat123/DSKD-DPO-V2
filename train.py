@@ -175,7 +175,6 @@ def main(config: DictConfig):
     policy_path = config.model.policy_name_or_path
     reference_path = config.model.reference_name_or_path if config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo', 'KD_tisdpo'} else None
 
-    world_size = 1
     if 'FSDP' in config.trainer and world_size > 1:
         print(f"🚀 Launching FSDP training with {world_size} processes")
         soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
