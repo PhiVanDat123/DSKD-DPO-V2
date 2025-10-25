@@ -160,7 +160,7 @@ def _get_batch_logps_tisdpo(logits: torch.FloatTensor, reference_logits: torch.F
             (per_token_logps * weights * loss_mask).sum(-1)
 
 
-def concatenated_inputs(batch: Dict[str, Union[List, torch.LongTensor]], mode: str) -> Dict[str, torch.LongTensor]:
+def concatenated_inputs(batch: Dict[str, Union[List, torch.LongTensor]]) -> Dict[str, torch.LongTensor]:
     """Concatenate the chosen and rejected inputs into a single tensor.
     
     Args:
@@ -290,10 +290,9 @@ class BasicTrainer(object):
         """
         # print("[DEBUG_INSIDE_TISDPO] Batch keys:", batch.keys())
         print("[DEBUG_INSIDE_TISDPO] Batch size:", batch['chosen_student_input_ids'].shape)
-        concatenated_batch_student = concatenated_inputs(batch, 'student')
-        concatenated_batch_teacher = concatenated_inputs(batch, 'teacher')
-        all_logits = model(concatenated_batch_student['concatenated_student_input_ids'],
-                           attention_mask=concatenated_batch_student['concatenated_student_attention_mask']).logits.to(torch.float32)
+        concatenated_batch = concatenated_inputs(batch)
+        all_logits = model(concatenated_batch['concatenated_student_input_ids'],
+                           attention_mask=concatenated_batch['concatenated_student_attention_mask']).logits.to(torch.float32)
         
         '''
         with torch.no_grad():
@@ -301,8 +300,8 @@ class BasicTrainer(object):
                                                    attention_mask=concatenated_batch[
                                                        'concatenated_attention_mask']).logits.to(torch.float32)
         '''
-        reference_all_logits = self.DSKD.compute_t2s_logits(concatenated_batch_teacher, self.distiller, self.policy, self.reference_model)
-        all_logps_margin, all_position_kl, all_logps = _get_batch_logps_tisdpo(all_logits, reference_all_logits, concatenated_batch_teacher['concatenated_teacher_labels'], concatenated_batch_teacher['concatenated_teacher_weight'], average_log_prob=False)
+        reference_all_logits = self.DSKD.compute_t2s_logits(concatenated_batch, self.distiller, self.policy, self.reference_model)
+        all_logps_margin, all_position_kl, all_logps = _get_batch_logps_tisdpo(all_logits, reference_all_logits, concatenated_batch['concatenated_student_labels'], concatenated_batch['concatenated_student_weight'], average_log_prob=False)
 
         chosen_logps_margin = all_logps_margin[:batch['chosen_student_input_ids'].shape[0]]
         rejected_logps_margin = all_logps_margin[batch['chosen_student_input_ids'].shape[0]:]
