@@ -64,6 +64,7 @@ def worker_main(rank: int, world_size: int, config: DictConfig, policy_path: str
         policy_dtype = getattr(torch, config.model.policy_dtype)
 
         # ✅ Load model on CPU to avoid OOM during initialization
+        # device_map="cpu" + low_cpu_mem_usage=True là đúng cách
         policy = transformers.AutoModelForCausalLM.from_pretrained(
             policy_path,
             torch_dtype=policy_dtype,
@@ -77,6 +78,11 @@ def worker_main(rank: int, world_size: int, config: DictConfig, policy_path: str
             policy.gradient_checkpointing_enable()
 
         print(f"[rank {rank}] Policy loaded successfully on CPU ({type(policy)})")
+
+        # *** IMPORTANT: KHÔNG gọi policy.to(device) hoặc policy.cuda() tại đây ***
+        # Vì sẽ gây ra lỗi storage out of bounds khi dùng low_cpu_mem_usage=True và device_map="cpu".
+        # FSDP wrapper hoặc trainer nên handle việc chuyển model lên GPU đúng cách.
+
     except Exception as e:
         print(f"[rank {rank}] ❌ ERROR loading policy: {e}")
         raise
@@ -101,6 +107,7 @@ def worker_main(rank: int, world_size: int, config: DictConfig, policy_path: str
             for p in reference_model.parameters():
                 p.requires_grad = False
             print(f"[rank {rank}] Reference model ready on CPU")
+            # KHÔNG chuyển reference_model lên GPU trực tiếp ở đây
         except Exception as e:
             print(f"[rank {rank}] ❌ ERROR loading reference model: {e}")
             raise
@@ -119,7 +126,7 @@ def worker_main(rank: int, world_size: int, config: DictConfig, policy_path: str
         world_size=world_size,
     )
 
-    # If trainer doesn’t attach reference_model automatically
+    # Nếu trainer không tự attach reference_model
     if reference_model is not None and getattr(trainer, "reference_model", None) is None:
         trainer.reference_model = reference_model
         print(f"[rank {rank}] Injected reference_model into trainer post-init")
