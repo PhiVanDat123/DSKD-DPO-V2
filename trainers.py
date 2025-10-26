@@ -528,7 +528,7 @@ class BasicTrainer(object):
             with open(metrics_file, "w") as f:
                 json.dump({"step": self.example_counter, "metrics": metrics}, f)
 
-
+'''
 class FSDPTrainer(BasicTrainer):
     def __init__(self, policy: nn.Module, config: DictConfig, seed: int, run_dir: str, reference_model: Optional[nn.Module] = None, rank: int = 0, world_size: int = 1):
         """A trainer subclass that uses PyTorch FSDP to shard the model across multiple GPUs.
@@ -633,4 +633,120 @@ class FSDPTrainer(BasicTrainer):
             
         del policy_state_dict
         dist.barrier()
-        
+'''
+
+class FSDPTrainer(BasicTrainer):
+    def __init__(self, policy: nn.Module, config: DictConfig, seed: int, run_dir: str,
+                 reference_model: Optional[nn.Module] = None, rank: int = 0, world_size: int = 1):
+        """FSDP Trainer (fixed): 
+        - Only shards the policy.
+        - Keeps reference model on CPU (not wrapped by FSDP).
+        - Ensures no meta tensors before wrapping.
+        """
+        super().__init__(policy, config, seed, run_dir, reference_model, rank, world_size)
+        assert config.model.policy_block_name is not None, \
+            'must specify model.block_name (e.g., GPT2Block or LlamaDecoderLayer) for FSDP'
+
+        # ---- Safety: check for meta tensors before wrapping ----
+        def assert_no_meta(model, name):
+            metas = [n for n, p in model.named_parameters() if getattr(p, "is_meta", False)]
+            if metas:
+                raise RuntimeError(
+                    f"[{name}] has meta tensors (uninitialized weights): {metas[:5]}...\n"
+                    f"Hint: load the model with low_cpu_mem_usage=False and device_map='cpu'"
+                )
+
+        assert_no_meta(policy, "policy")
+        if reference_model is not None:
+            assert_no_meta(reference_model, "reference_model")
+
+        # ---- FSDP wrapping ----
+        wrap_class = get_block_class_from_model(policy, config.model.policy_block_name)
+        model_auto_wrap_policy = functools.partial(
+            transformer_auto_wrap_policy,
+            transformer_layer_cls={wrap_class},
+        )
+
+        shared_fsdp_kwargs = dict(
+            auto_wrap_policy=model_auto_wrap_policy,
+            sharding_strategy=ShardingStrategy.FULL_SHARD,
+            cpu_offload=CPUOffload(offload_params=False),
+            backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
+            device_id=rank,
+            ignored_modules=None,
+            limit_all_gathers=False,
+            use_orig_params=False,
+            sync_module_states=False
+        )
+
+        rank0_print("Sharding policy with FSDP...")
+        mp_dtype = getattr(torch, config.model.fsdp_policy_mp) if config.model.fsdp_policy_mp is not None else None
+        policy_mp_policy = MixedPrecision(param_dtype=mp_dtype, reduce_dtype=mp_dtype, buffer_dtype=mp_dtype)
+        self.policy = FSDP(policy, **shared_fsdp_kwargs, mixed_precision=policy_mp_policy)
+
+        # ---- Activation checkpointing ----
+        if config.activation_checkpointing:
+            rank0_print("Attempting to enable activation checkpointing...")
+            try:
+                from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+                    checkpoint_wrapper,
+                    apply_activation_checkpointing,
+                    CheckpointImpl,
+                )
+                non_reentrant_wrapper = functools.partial(
+                    checkpoint_wrapper,
+                    offload_to_cpu=False,
+                    checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+                )
+                check_fn = lambda submodule: isinstance(submodule, wrap_class)
+                apply_activation_checkpointing(
+                    self.policy,
+                    checkpoint_wrapper_fn=non_reentrant_wrapper,
+                    check_fn=check_fn,
+                )
+                rank0_print("FSDP activation checkpointing enabled!")
+            except Exception as e:
+                rank0_print("Activation checkpointing not available:", e)
+
+        # ---- Reference model: keep on CPU, frozen ----
+        if self.reference_model is not None:
+            rank0_print("Keeping reference_model on CPU (not FSDP-wrapped).")
+            self.reference_model = reference_model.cpu()
+            self.reference_model.eval()
+            for p in self.reference_model.parameters():
+                p.requires_grad_(False)
+
+        print(f"Loaded model on rank {rank}")
+        dist.barrier()
+
+    def clip_gradient(self):
+        """Clip gradients safely with FSDP-aware norm computation."""
+        return self.policy.clip_grad_norm_(self.config.max_grad_norm).item()
+
+    def save(self, output_dir=None, metrics=None):
+        """Save policy state (FSDP full state dict) and tokenizer."""
+        save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(self.policy, StateDictType.FULL_STATE_DICT, state_dict_config=save_policy):
+            policy_state_dict = self.policy.state_dict()
+
+        if self.rank == 0:
+            model_save_dir = output_dir or self.run_dir
+            os.makedirs(model_save_dir, exist_ok=True)
+
+            from transformers import AutoModelForCausalLM
+            model_name = self.config.model.policy_name_or_path
+            unwrapped_model = AutoModelForCausalLM.from_pretrained(model_name)
+            unwrapped_model.load_state_dict(policy_state_dict)
+            unwrapped_model.save_pretrained(model_save_dir)
+            self.student_tokenizer.save_pretrained(model_save_dir)
+
+            if metrics is not None:
+                metrics_file = os.path.join(model_save_dir, "training_metrics.json")
+                with open(metrics_file, "w") as f:
+                    json.dump({"step": self.example_counter, "metrics": metrics}, f)
+
+            rank0_print(f"Model saved to {model_save_dir}")
+            del unwrapped_model
+
+        del policy_state_dict
+        dist.barrier()
