@@ -1,5 +1,4 @@
 import os
-
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
 import socket
@@ -29,17 +28,10 @@ OmegaConf.register_new_resolver(
 )
 
 
-
 def worker_main(rank: int, world_size: int, config: DictConfig, policy_path: str, reference_path: Optional[str] = None):
     """
     Worker entrypoint: load models inside each worker (to avoid pickling issues),
     create trainer and run training.
-    Args:
-      rank: worker rank (0..world_size-1)
-      world_size: total number of processes
-      config: OmegaConf config (resolved)
-      policy_path: local path / HF id for policy model
-      reference_path: local path / HF id for reference model (or None)
     """
 
     # init distributed if FSDP
@@ -65,7 +57,7 @@ def worker_main(rank: int, world_size: int, config: DictConfig, policy_path: str
             name=config.exp_name,
         )
 
-    # ------------- load policy inside worker -------------
+    # ------------------ Load policy ------------------
     print(f"[rank {rank}] Loading policy from: {policy_path}")
     policy = None
     try:
@@ -76,17 +68,23 @@ def worker_main(rank: int, world_size: int, config: DictConfig, policy_path: str
             torch_dtype=policy_dtype
         )
         disable_dropout(policy)
-        # try to move to device but ignore if FSDP will wrap
+
+        # ✅ enable gradient checkpointing to save memory
+        if hasattr(policy, "gradient_checkpointing_enable"):
+            policy.gradient_checkpointing_enable()
+
+        # move to device
         try:
             policy.to(device)
         except Exception:
             pass
+
         print(f"[rank {rank}] Policy loaded successfully ({type(policy)})")
     except Exception as e:
         print(f"[rank {rank}] ERROR loading policy from {policy_path}: {e}")
         raise
 
-    # ------------- load reference model inside worker (if needed) -------------
+    # ------------------ Load reference model ------------------
     reference_model = None
     if config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo', 'KD_tisdpo'}:
         if reference_path is None:
@@ -100,21 +98,22 @@ def worker_main(rank: int, world_size: int, config: DictConfig, policy_path: str
                 torch_dtype=ref_dtype
             )
             disable_dropout(reference_model)
-            try:
-                reference_model.to(device)
-            except Exception:
-                pass
-            print(f"[rank {rank}] Reference model loaded successfully ({type(reference_model)})")
+
+            # ✅ keep reference on CPU to save GPU memory
+            reference_model.eval()
+            for p in reference_model.parameters():
+                p.requires_grad = False
+            reference_model.to("cpu")
+
+            print(f"[rank {rank}] Reference model loaded on CPU ({type(reference_model)})")
         except Exception as e:
             print(f"[rank {rank}] ERROR loading reference model from {reference_path}: {e}")
             raise
 
-    # ------------- create trainer -------------
+    # ------------------ Create trainer ------------------
     TrainerClass = getattr(trainers, config.trainer)
     print(f"[rank {rank}] Creating trainer (policy present: {policy is not None}, reference present: {reference_model is not None})")
 
-    # Some Trainer implementations may expect the model objects or may expect paths.
-    # We pass the loaded model objects; if Trainer.__init__ does not accept, adjust there.
     trainer = TrainerClass(
         policy,
         config,
@@ -125,11 +124,19 @@ def worker_main(rank: int, world_size: int, config: DictConfig, policy_path: str
         world_size=world_size,
     )
 
-    # defensive: if TrainerClass.__init__ did not set trainer.reference_model, inject it
     if reference_model is not None and getattr(trainer, "reference_model", None) is None:
         trainer.reference_model = reference_model
-        print(f"[rank {rank}] Injected reference_model into trainer.post-init")
+        print(f"[rank {rank}] Injected reference_model into trainer post-init")
 
+    # ✅ Debug GPU memory before training
+    if torch.cuda.is_available():
+        try:
+            print(f"[rank {rank}] CUDA memory summary before training:")
+            print(torch.cuda.memory_summary(device=device, abbreviated=True))
+        except Exception:
+            pass
+
+    # ------------------ Train ------------------
     print(f"[rank {rank}] Starting training")
     trainer.train()
     trainer.save()
@@ -138,11 +145,8 @@ def worker_main(rank: int, world_size: int, config: DictConfig, policy_path: str
 
 @hydra.main(version_base=None, config_path="config", config_name="config")
 def main(config: DictConfig):
-    """Main entry point for training — sets up config, resolves transform, and spawns worker process(es)."""
-
     OmegaConf.resolve(config)
 
-    # ---------------- basic sanity checks ----------------
     missing_keys: Set[str] = OmegaConf.missing_keys(config)
     if missing_keys:
         raise ValueError(f"Got missing keys in config:\n{missing_keys}")
@@ -168,12 +172,15 @@ def main(config: DictConfig):
 
     os.environ['XDG_CACHE_HOME'] = get_local_dir(config.output_dir)
 
-    # ---------------- spawn workers or run single process ----------------
     world_size = torch.cuda.device_count() if 'FSDP' in config.trainer else 1
     print(f"Detected {world_size} CUDA devices")
 
     policy_path = config.model.policy_name_or_path
-    reference_path = config.model.reference_name_or_path if config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo', 'KD_tisdpo'} else None
+    reference_path = (
+        config.model.reference_name_or_path
+        if config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo', 'KD_tisdpo'}
+        else None
+    )
 
     if 'FSDP' in config.trainer and world_size > 1:
         print(f"🚀 Launching FSDP training with {world_size} processes")
@@ -194,3 +201,4 @@ def main(config: DictConfig):
 
 if __name__ == '__main__':
     main()
+
