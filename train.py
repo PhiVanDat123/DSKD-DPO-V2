@@ -38,7 +38,8 @@ def worker_main(rank: int, world_size: int, config: DictConfig, policy_path: str
     if 'FSDP' in config.trainer:
         init_distributed(rank, world_size, port=config.fsdp_port)
 
-    device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
+    has_cuda = torch.cuda.is_available()
+    device = torch.device(f"cuda:{rank}" if has_cuda else "cpu")
     print(f"[rank {rank}] device = {device}")
 
     # minimal wandb no-op for debug mode
@@ -62,23 +63,52 @@ def worker_main(rank: int, world_size: int, config: DictConfig, policy_path: str
     policy = None
     try:
         policy_dtype = getattr(torch, config.model.policy_dtype)
-        policy = transformers.AutoModelForCausalLM.from_pretrained(
-            policy_path,
-            low_cpu_mem_usage=True,
-            torch_dtype=policy_dtype
-        )
+
+        # Preferred: if CUDA is available, let transformers place parameters automatically (device_map="auto").
+        # Fallback: use low_cpu_mem_usage but DO NOT call .to(device) immediately (that caused storage issues).
+        if has_cuda:
+            try:
+                # device_map="auto" requires accelerate/transformers support; try it first for safe loading
+                policy = transformers.AutoModelForCausalLM.from_pretrained(
+                    policy_path,
+                    device_map="auto",
+                    torch_dtype=policy_dtype,
+                )
+                print(f"[rank {rank}] Policy loaded with device_map='auto'.")
+            except Exception as e_auto:
+                # fallback: low_cpu_mem_usage (safe) but do NOT call .to(device) which may cause storage issues
+                print(f"[rank {rank}] device_map='auto' failed ({e_auto}); falling back to low_cpu_mem_usage and CPU staging.")
+                policy = transformers.AutoModelForCausalLM.from_pretrained(
+                    policy_path,
+                    low_cpu_mem_usage=True,
+                    torch_dtype=policy_dtype
+                )
+                # Don't call policy.to(device) here to avoid storage corruption when model is staged.
+                # Trainer / downstream code should move model or you can reload with device_map if desired.
+        else:
+            # No CUDA: load normally (low memory usage)
+            policy = transformers.AutoModelForCausalLM.from_pretrained(
+                policy_path,
+                low_cpu_mem_usage=True,
+                torch_dtype=policy_dtype
+            )
+            try:
+                policy.to(device)
+            except Exception:
+                pass
+
         disable_dropout(policy)
 
-        # ✅ enable gradient checkpointing to save memory
-        if hasattr(policy, "gradient_checkpointing_enable"):
-            policy.gradient_checkpointing_enable()
-
-        # move to device
+        # Enable gradient checkpointing if supported (saves memory during backward).
         try:
-            policy.to(device)
+            if hasattr(policy, "gradient_checkpointing_enable"):
+                policy.gradient_checkpointing_enable()
         except Exception:
             pass
 
+        # If model was loaded without device_map and CUDA is available and we explicitly want it on GPU,
+        # move it safely only if it is fully in CPU memory (i.e., low_cpu_mem_usage was False).
+        # We avoid unconditional policy.to(device) to prevent the "setStorage out of bounds" issue.
         print(f"[rank {rank}] Policy loaded successfully ({type(policy)})")
     except Exception as e:
         print(f"[rank {rank}] ERROR loading policy from {policy_path}: {e}")
@@ -92,20 +122,35 @@ def worker_main(rank: int, world_size: int, config: DictConfig, policy_path: str
         print(f"[rank {rank}] Loading reference model from: {reference_path}")
         try:
             ref_dtype = getattr(torch, config.model.reference_dtype)
-            reference_model = transformers.AutoModelForCausalLM.from_pretrained(
-                reference_path,
-                low_cpu_mem_usage=True,
-                torch_dtype=ref_dtype
-            )
-            disable_dropout(reference_model)
 
-            # ✅ keep reference on CPU to save GPU memory
+            # Load reference on CPU to avoid doubling GPU memory usage.
+            # If you need reference on GPU for speed, consider device_map or offload strategies.
+            try:
+                reference_model = transformers.AutoModelForCausalLM.from_pretrained(
+                    reference_path,
+                    device_map="cpu",
+                    torch_dtype=ref_dtype,
+                )
+                print(f"[rank {rank}] Reference model loaded with device_map='cpu'.")
+            except Exception as e_cpu_map:
+                # Fallback to low_cpu_mem_usage and ensure it's on CPU
+                print(f"[rank {rank}] device_map='cpu' failed ({e_cpu_map}); falling back to low_cpu_mem_usage and CPU placement.")
+                reference_model = transformers.AutoModelForCausalLM.from_pretrained(
+                    reference_path,
+                    low_cpu_mem_usage=True,
+                    torch_dtype=ref_dtype
+                )
+                try:
+                    reference_model.to("cpu")
+                except Exception:
+                    pass
+
+            disable_dropout(reference_model)
             reference_model.eval()
             for p in reference_model.parameters():
                 p.requires_grad = False
-            reference_model.to("cpu")
 
-            print(f"[rank {rank}] Reference model loaded on CPU ({type(reference_model)})")
+            print(f"[rank {rank}] Reference model ready on CPU ({type(reference_model)})")
         except Exception as e:
             print(f"[rank {rank}] ERROR loading reference model from {reference_path}: {e}")
             raise
@@ -128,7 +173,7 @@ def worker_main(rank: int, world_size: int, config: DictConfig, policy_path: str
         trainer.reference_model = reference_model
         print(f"[rank {rank}] Injected reference_model into trainer post-init")
 
-    # ✅ Debug GPU memory before training
+    # Debug GPU memory before training
     if torch.cuda.is_available():
         try:
             print(f"[rank {rank}] CUDA memory summary before training:")
@@ -201,4 +246,5 @@ def main(config: DictConfig):
 
 if __name__ == '__main__':
     main()
+
 
