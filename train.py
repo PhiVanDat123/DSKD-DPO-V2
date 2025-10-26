@@ -43,6 +43,17 @@ def _print_param_meta(model, name="model"):
     return meta_found
 
 
+def _debug_param_storage(model, name="model"):
+    # Print device / meta / storage information to help diagnose storage-size=0 issues
+    for n, p in model.named_parameters():
+        try:
+            st = p.storage()
+            st_size = st.size() if st is not None else None
+        except Exception as e:
+            st_size = f"err:{e}"
+        print(f"[DEBUG] {name} param {n}: device={p.device}, is_meta={getattr(p,'is_meta',False)}, numel={p.numel()}, storage_size={st_size}")
+
+
 def worker_main(rank: int, world_size: int, config: DictConfig, policy_path: str, reference_path: Optional[str] = None):
     # ---------------- Init distributed ----------------
     if 'FSDP' in config.trainer:
@@ -74,7 +85,7 @@ def worker_main(rank: int, world_size: int, config: DictConfig, policy_path: str
     policy_dtype = getattr(torch, config.model.policy_dtype)
 
     if 'FSDP' in config.trainer and world_size > 1:
-        # FSDP cần real tensors, không meta
+        # FSDP needs real tensors (not meta). Load to CPU first.
         policy = transformers.AutoModelForCausalLM.from_pretrained(
             policy_path,
             torch_dtype=policy_dtype,
@@ -82,7 +93,7 @@ def worker_main(rank: int, world_size: int, config: DictConfig, policy_path: str
             low_cpu_mem_usage=False
         )
     else:
-        # Single GPU: load vào CPU rồi .to(device)
+        # Single GPU: load onto CPU then move to device
         policy = transformers.AutoModelForCausalLM.from_pretrained(
             policy_path,
             torch_dtype=policy_dtype,
@@ -91,9 +102,19 @@ def worker_main(rank: int, world_size: int, config: DictConfig, policy_path: str
         )
         policy.to(device)
 
+    # Debug print parameters/storage after load
+    _debug_param_storage(policy, "policy (after load)")
+
     disable_dropout(policy)
-    if hasattr(policy, "gradient_checkpointing_enable"):
-        policy.gradient_checkpointing_enable()
+
+    # Only enable gradient checkpointing when NOT using FSDP multi-process.
+    # If using FSDP, checkpointing should be enabled *after* FSDP wrap inside trainer
+    if world_size == 1:
+        if hasattr(policy, "gradient_checkpointing_enable"):
+            policy.gradient_checkpointing_enable()
+            print(f"[rank {rank}] Gradient checkpointing enabled (single-process)")
+    else:
+        print(f"[rank {rank}] Skipping enabling gradient checkpointing here because using FSDP; trainer should enable it after FSDP wrap if supported.")
 
     if _print_param_meta(policy, "policy"):
         raise RuntimeError(f"[rank {rank}] Policy has meta params after load.")
@@ -112,7 +133,7 @@ def worker_main(rank: int, world_size: int, config: DictConfig, policy_path: str
         reference_model = transformers.AutoModelForCausalLM.from_pretrained(
             reference_path,
             torch_dtype=ref_dtype,
-            device_map={"": "cpu"},      # ✅ tuyệt đối không lên GPU
+            device_map={"": "cpu"},      # ✅ absolutely keep reference on CPU
             low_cpu_mem_usage=False
         )
 
@@ -123,6 +144,8 @@ def worker_main(rank: int, world_size: int, config: DictConfig, policy_path: str
 
         if _print_param_meta(reference_model, "reference_model"):
             raise RuntimeError(f"[rank {rank}] Reference model has meta params after load.")
+
+        _debug_param_storage(reference_model, "reference (after load)")
 
         print(f"[rank {rank}] ✅ Reference model loaded on CPU and frozen.")
 
@@ -139,6 +162,15 @@ def worker_main(rank: int, world_size: int, config: DictConfig, policy_path: str
     )
     if getattr(trainer, "reference_model", None) is None and reference_model is not None:
         trainer.reference_model = reference_model
+
+    # If trainer wraps policy with FSDP, trainer should enable gradient checkpointing AFTER wrap if desired.
+    # Provide a hook for trainer to enable checkpointing (trainer can check config.enable_checkpointing_after_wrap)
+    if hasattr(trainer, "post_wrap_enable_checkpointing") and world_size > 1:
+        try:
+            trainer.post_wrap_enable_checkpointing()
+            print(f"[rank {rank}] Trainer enabled gradient checkpointing after FSDP wrap (if supported)")
+        except Exception:
+            print(f"[rank {rank}] Trainer does not support post-wrap checkpoint enabling or it failed")
 
     # ---------------- Train ----------------
     if torch.cuda.is_available():
@@ -213,6 +245,7 @@ def main(config: DictConfig):
 
 if __name__ == '__main__':
     main()
+
 
 
 
