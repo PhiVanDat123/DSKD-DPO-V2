@@ -1,5 +1,4 @@
 import os
-# Giữ expandable_segments nhưng thêm max_split_size_mb để giảm phân mảnh (tùy hệ thống)
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True,max_split_size_mb:128'
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
@@ -20,14 +19,13 @@ from utils import get_local_dir, get_local_run_dir, disable_dropout, init_distri
 import trainers
 from transform_config import TransformConfig, get_transform_config
 
-# Nếu bạn dùng Linux cluster đôi khi cần set start method 'spawn' sớm
+
 try:
     mp.set_start_method('spawn', force=True)
 except RuntimeError:
-    # start method đã set trước đó
     pass
 
-# Register resolvers used by Hydra config
+
 OmegaConf.register_new_resolver("get_local_run_dir", lambda exp_name, local_dir: get_local_run_dir(exp_name, local_dir))
 OmegaConf.register_new_resolver(
     "build_exp_name",
@@ -37,45 +35,31 @@ OmegaConf.register_new_resolver(
 
 
 def _print_param_meta(model, name="model"):
-    """Debug helper: show if any param is meta or has no device."""
     meta_found = False
     for n, p in model.named_parameters():
-        is_meta = getattr(p, "is_meta", False)
-        dev = getattr(p, "device", None)
-        if is_meta or dev is None:
-            print(f"[DEBUG] {name} param {n}: is_meta={is_meta}, device={dev}, numel={p.numel()}")
+        if getattr(p, "is_meta", False):
+            print(f"[DEBUG] {name} param {n}: is_meta=True")
             meta_found = True
-            # don't break, print all suspicious params
     return meta_found
 
 
 def worker_main(rank: int, world_size: int, config: DictConfig, policy_path: str, reference_path: Optional[str] = None):
-    """
-    Worker entrypoint for distributed (FSDP) or single-GPU training.
-    """
-
-    # ---------------- Initialize distributed ----------------
+    # ---------------- Init distributed ----------------
     if 'FSDP' in config.trainer:
-        # đảm bảo device mapping ổn định
-        # torch.cuda.set_device may raise if rank >= cuda_count; check first
         if torch.cuda.is_available():
             n_gpus = torch.cuda.device_count()
-            # map rank to gpu index defensively
             gpu_idx = rank % max(1, n_gpus)
             torch.cuda.set_device(gpu_idx)
         init_distributed(rank, world_size, port=config.fsdp_port)
 
-    has_cuda = torch.cuda.is_available()
-    # map device same như set_device ở trên
-    device = torch.device(f"cuda:{rank % max(1, torch.cuda.device_count())}" if has_cuda else "cpu")
+    device = torch.device(f"cuda:{rank % max(1, torch.cuda.device_count())}" if torch.cuda.is_available() else "cpu")
     print(f"[rank {rank}] Using device: {device}")
 
-    # ---------------- W&B Setup ----------------
+    # ---------------- W&B ----------------
     if config.debug:
-        wandb.init = lambda *args, **kwargs: None
-        wandb.log = lambda *args, **kwargs: None
-
-    if rank == 0 and getattr(config, "wandb", None) and config.wandb.enabled:
+        wandb.init = lambda *a, **kw: None
+        wandb.log = lambda *a, **kw: None
+    elif rank == 0 and getattr(config, "wandb", None) and config.wandb.enabled:
         os.environ['WANDB_CACHE_DIR'] = get_local_dir(config.output_dir)
         wandb.init(
             entity=config.wandb.entity,
@@ -85,116 +69,65 @@ def worker_main(rank: int, world_size: int, config: DictConfig, policy_path: str
             name=config.exp_name,
         )
 
-    # ---------------- Load Policy Model ----------------
+    # ---------------- Load Policy ----------------
     print(f"[rank {rank}] Loading policy model from: {policy_path}")
-    policy = None
-    try:
-        policy_dtype = getattr(torch, config.model.policy_dtype)
+    policy_dtype = getattr(torch, config.model.policy_dtype)
 
-        # Khi chạy FSDP (multi-GPU): KHÔNG dùng low_cpu_mem_usage=True (tránh meta tensors)
-        if 'FSDP' in config.trainer and world_size > 1:
-            # Load fully on CPU (real tensors) so FSDP có thể wrap/distribute an toàn.
-            policy = transformers.AutoModelForCausalLM.from_pretrained(
-                policy_path,
-                torch_dtype=policy_dtype,
-                low_cpu_mem_usage=False,   # IMPORTANT: avoid meta tensors when using FSDP
-                device_map="cpu",          # load on CPU then FSDP will shard/dispatch
-            )
-            print(f"[rank {rank}] Policy loaded on CPU for FSDP (no low_cpu_mem_usage).")
-        else:
-            # Single-process/single-GPU: let HF dispatch automatically if GPU available
-            if torch.cuda.is_available():
-                policy = transformers.AutoModelForCausalLM.from_pretrained(
-                    policy_path,
-                    torch_dtype=policy_dtype,
-                    device_map="cpu",
-                    low_cpu_mem_usage=False,
-                )
-                # if from_pretrained dispatched to gpu, don't call .to(device) again
-            else:
-                policy = transformers.AutoModelForCausalLM.from_pretrained(
-                    policy_path,
-                    torch_dtype=policy_dtype,
-                    device_map="cpu",
-                    low_cpu_mem_usage=False,
-                )
-                policy.to(device)
-            print(f"[rank {rank}] Policy loaded (auto dispatch if possible).")
+    if 'FSDP' in config.trainer and world_size > 1:
+        # FSDP cần real tensors, không meta
+        policy = transformers.AutoModelForCausalLM.from_pretrained(
+            policy_path,
+            torch_dtype=policy_dtype,
+            device_map="cpu",
+            low_cpu_mem_usage=False
+        )
+    else:
+        # Single GPU: load vào CPU rồi .to(device)
+        policy = transformers.AutoModelForCausalLM.from_pretrained(
+            policy_path,
+            torch_dtype=policy_dtype,
+            device_map="cpu",
+            low_cpu_mem_usage=False
+        )
+        policy.to(device)
 
-        disable_dropout(policy)
+    disable_dropout(policy)
+    if hasattr(policy, "gradient_checkpointing_enable"):
+        policy.gradient_checkpointing_enable()
 
-        # Enable gradient checkpointing if available
-        if hasattr(policy, "gradient_checkpointing_enable"):
-            policy.gradient_checkpointing_enable()
+    if _print_param_meta(policy, "policy"):
+        raise RuntimeError(f"[rank {rank}] Policy has meta params after load.")
 
-        # Debug: kiểm tra metadata parameters (phát hiện meta tensors sớm)
-        if _print_param_meta(policy, "policy"):
-            raise RuntimeError(f"[rank {rank}] Detected meta parameters in policy after load. Aborting to avoid storage errors.")
-
-    except RuntimeError as e:
-        # Nếu OOM hoặc meta issue, in ra thông tin hữu ích
-        print(f"[rank {rank}] ❌ ERROR loading policy (RuntimeError): {e}")
-        raise
-    except Exception as e:
-        print(f"[rank {rank}] ❌ ERROR loading policy: {e}")
-        raise
+    print(f"[rank {rank}] ✅ Policy model loaded successfully.")
 
     # ---------------- Load Reference Model (CPU only) ----------------
     reference_model = None
     if config.loss.name in {'dpo', 'ipo', 'tdpo', 'tisdpo', 'KD_tisdpo'}:
         if reference_path is None:
-            raise RuntimeError("reference_path must be provided for DPO-style losses")
-        print(f"[rank {rank}] Loading reference model from: {reference_path}")
+            raise RuntimeError("reference_path required for DPO-style losses")
 
-        try:
-            ref_dtype = getattr(torch, config.model.reference_dtype)
+        print(f"[rank {rank}] Loading reference model (CPU-only) from: {reference_path}")
+        ref_dtype = getattr(torch, config.model.reference_dtype)
 
-            # same rule: avoid low_cpu_mem_usage when we will use FSDP
-            if 'FSDP' in config.trainer and world_size > 1:
-                reference_model = transformers.AutoModelForCausalLM.from_pretrained(
-                    reference_path,
-                    torch_dtype=ref_dtype,
-                    device_map="cpu",
-                    low_cpu_mem_usage=False,
-                )
-            else:
-                # for single-gpu, let HF dispatch to GPU automatically
-                if torch.cuda.is_available():
-                    reference_model = transformers.AutoModelForCausalLM.from_pretrained(
-                        reference_path,
-                        torch_dtype=ref_dtype,
-                        device_map="auto",
-                        low_cpu_mem_usage=False,
-                    )
-                else:
-                    reference_model = transformers.AutoModelForCausalLM.from_pretrained(
-                        reference_path,
-                        torch_dtype=ref_dtype,
-                        device_map="cpu",
-                        low_cpu_mem_usage=False,
-                    )
-                    reference_model.to(device)
+        reference_model = transformers.AutoModelForCausalLM.from_pretrained(
+            reference_path,
+            torch_dtype=ref_dtype,
+            device_map={"": "cpu"},      # ✅ tuyệt đối không lên GPU
+            low_cpu_mem_usage=False
+        )
 
-            disable_dropout(reference_model)
-            reference_model.eval()
-            for p in reference_model.parameters():
-                p.requires_grad = False
+        disable_dropout(reference_model)
+        reference_model.eval()
+        for p in reference_model.parameters():
+            p.requires_grad = False
 
-            if _print_param_meta(reference_model, "reference_model"):
-                raise RuntimeError(f"[rank {rank}] Detected meta parameters in reference_model after load. Aborting to avoid storage errors.")
+        if _print_param_meta(reference_model, "reference_model"):
+            raise RuntimeError(f"[rank {rank}] Reference model has meta params after load.")
 
-            print(f"[rank {rank}] Reference model ready.")
-        except RuntimeError as e:
-            print(f"[rank {rank}] ❌ ERROR loading reference model (RuntimeError): {e}")
-            raise
-        except Exception as e:
-            print(f"[rank {rank}] ❌ ERROR loading reference model: {e}")
-            raise
+        print(f"[rank {rank}] ✅ Reference model loaded on CPU and frozen.")
 
     # ---------------- Create Trainer ----------------
     TrainerClass = getattr(trainers, config.trainer)
-    print(f"[rank {rank}] Creating trainer...")
-
     trainer = TrainerClass(
         policy,
         config,
@@ -204,65 +137,49 @@ def worker_main(rank: int, world_size: int, config: DictConfig, policy_path: str
         rank=rank,
         world_size=world_size,
     )
-
-    # Nếu trainer không tự attach reference_model
-    if reference_model is not None and getattr(trainer, "reference_model", None) is None:
+    if getattr(trainer, "reference_model", None) is None and reference_model is not None:
         trainer.reference_model = reference_model
-        print(f"[rank {rank}] Injected reference_model into trainer post-init")
 
-    # ---------------- Debug GPU Memory ----------------
+    # ---------------- Train ----------------
     if torch.cuda.is_available():
         try:
-            print(f"[rank {rank}] CUDA memory summary before training:")
             print(torch.cuda.memory_summary(device=device, abbreviated=True))
         except Exception:
             pass
 
-    # ---------------- Train ----------------
+    print(f"[rank {rank}] 🚀 Starting training")
     try:
-        print(f"[rank {rank}] 🚀 Starting training")
         trainer.train()
         trainer.save()
-        print(f"[rank {rank}] ✅ Training finished")
+        print(f"[rank {rank}] ✅ Training finished successfully")
     except RuntimeError as e:
-        # Catch common CUDA OOM and give actionable hints
-        if 'out of memory' in str(e).lower():
-            print(f"[rank {rank}] ❌ CUDA out of memory during training: {e}")
-            print("Suggestions: reduce batch_size, use mixed precision (torch_dtype=float16),"
-                  " use 8-bit loading (bitsandbytes) or enable gradient checkpointing.")
+        if "out of memory" in str(e).lower():
+            print(f"[rank {rank}] ❌ CUDA OOM: {e}")
+            print("Try reducing batch_size or using fp16.")
         raise
 
 
 @hydra.main(version_base=None, config_path="config", config_name="config")
 def main(config: DictConfig):
     OmegaConf.resolve(config)
-
-    missing_keys: Set[str] = OmegaConf.missing_keys(config)
-    if missing_keys:
-        raise ValueError(f"Got missing keys in config:\n{missing_keys}")
+    if OmegaConf.missing_keys(config):
+        raise ValueError("Missing keys in config")
 
     if config.eval_every % config.batch_size != 0:
-        print('⚠️ eval_every must be divisible by batch_size. Adjusting.')
         config.eval_every -= config.eval_every % config.batch_size
-        print(f'Adjusted eval_every = {config.eval_every}')
 
     if 'FSDP' in config.trainer and config.fsdp_port is None:
-        free_port = get_open_port()
-        print('No FSDP port specified; using open port:', free_port)
-        config.fsdp_port = free_port
+        config.fsdp_port = get_open_port()
 
     os.makedirs(config.local_run_dir, exist_ok=True)
-    config_path = os.path.join(config.local_run_dir, 'config.yaml')
-    with open(config_path, 'w') as f:
-        OmegaConf.save(config, f)
+    OmegaConf.save(config, os.path.join(config.local_run_dir, 'config.yaml'))
 
     print('=' * 80)
-    print(f'Running on {socket.gethostname()} | Output dir: {config.local_run_dir}')
+    print(f"Running on {socket.gethostname()} | Output dir: {config.local_run_dir}")
     print('=' * 80)
 
     os.environ['XDG_CACHE_HOME'] = get_local_dir(config.output_dir)
 
-    # kiểm tra number of visible CUDA devices
     available_cuda = torch.cuda.device_count()
     print(f"Detected {available_cuda} CUDA devices")
 
@@ -277,16 +194,11 @@ def main(config: DictConfig):
         world_size = available_cuda
         print(f"🚀 Launching FSDP with {world_size} processes")
 
-        # tăng file descriptors để tránh issues khi spawn nhiều tiến trình
         soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
         try:
             resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
-            print(f"Set RLIMIT_NOFILE soft limit to {hard} from {soft}")
-        except Exception as e:
-            print("Could not set RLIMIT_NOFILE:", e)
-
-        # Optional: nếu muốn ép mapping GPU cụ thể, set CUDA_VISIBLE_DEVICES trước spawn
-        # os.environ['CUDA_VISIBLE_DEVICES'] = "0,1,2,3"   # set phù hợp với cluster của bạn
+        except Exception:
+            pass
 
         mp.spawn(
             worker_main,
@@ -295,13 +207,13 @@ def main(config: DictConfig):
             join=True
         )
     else:
-        # single-process
-        print("🚀 Launching single-process training (no FSDP)")
+        print("🚀 Launching single-process training")
         worker_main(0, 1, config, policy_path, reference_path)
 
 
 if __name__ == '__main__':
     main()
+
 
 
 
