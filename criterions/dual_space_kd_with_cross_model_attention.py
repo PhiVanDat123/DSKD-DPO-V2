@@ -3,6 +3,24 @@ import torch
 from .various_divergence import VariousDivergence
 from .soft_dtw_cuda import SoftDTW
 
+def _pairwise_cosine_distance_chunked(a, b, chunk_size=128):
+    # a: (S, D), b: (T, D)
+    # returns 1 - cosine_sim matrix (S, T) computed in chunks over a
+    # assume a, b are float tensors on same device
+    # normalize in-place view
+        a_norm = a / (a.norm(dim=-1, keepdim=True) + 1e-8)
+        b_norm = b / (b.norm(dim=-1, keepdim=True) + 1e-8)
+
+        S = a_norm.size(0)
+        rows = []
+        for i in range(0, S, chunk_size):
+            a_chunk = a_norm[i:i+chunk_size]            # (c, D)
+            # (c, D) @ (D, T) -> (c, T)
+            chunk_dot = torch.matmul(a_chunk, b_norm.transpose(0, 1))
+            # cosine similarity in [-1,1], we want distance = 1 - sim
+            rows.append(1.0 - chunk_dot)
+        return torch.cat(rows, dim=0)  # (S, T)
+
 
 class DualSpaceKDWithCMA(VariousDivergence):
     def __init__(self, config, distiller, padding_id=-100) -> None:
@@ -189,61 +207,58 @@ class DualSpaceKDWithCMA(VariousDivergence):
 
         return total_dtw_loss
 
-    
+
     def _calculate_alignment_loss(self, student_embs, teacher_embs, student_mask, teacher_mask):
         batch_size = student_embs.size(0)
-        total_loss = torch.tensor(0.0, device=student_embs.device, requires_grad=True)
+        device = student_embs.device
+        total_loss = torch.tensor(0.0, device=device)  # no requires_grad here
         non_empty_pairs = 0
 
+        # detach teacher_embs if teacher shouldn't require grad
+        # (project teacher before calling this and detach earlier is better)
+        if teacher_embs.requires_grad:
+            teacher_embs = teacher_embs.detach()
+
+        # choose chunk size adaptively if you want
+        # smaller chunk -> less peak mem but more loops
+        chunk_size = 128
+
         for i in range(batch_size):
-            s_len = student_mask[i].sum().item()
-            t_len = teacher_mask[i].sum().item()
+            s_len = int(student_mask[i].sum().item())
+            t_len = int(teacher_mask[i].sum().item())
 
             if s_len == 0 or t_len == 0:
                 continue
-            
+
             non_empty_pairs += 1
 
-            s_seq = student_embs[i, :s_len, :]
-            t_seq = teacher_embs[i, :t_len, :]
+            s_seq = student_embs[i, :s_len, :].contiguous()
+            t_seq = teacher_embs[i, :t_len, :].contiguous()
 
-            print("[DEBUG] s_seq shape:", s_seq.shape)
-            print("[DEBUG] t_seq shape:", t_seq.shape)
-            c_stu_tea = 1.0 - torch.cosine_similarity(
-                s_seq.unsqueeze(1), t_seq.unsqueeze(0), dim=-1
-            )
+            # debug shapes (optional)
+            # print("[DEBUG] s_seq shape:", s_seq.shape)
+            # print("[DEBUG] t_seq shape:", t_seq.shape)
 
-            c_stu_stu = 1.0 - torch.cosine_similarity(
-                s_seq.unsqueeze(1), s_seq.unsqueeze(0), dim=-1
-            )
+            # compute pairwise distances in chunks to avoid huge allocation
+            c_stu_tea = _pairwise_cosine_distance_chunked(s_seq, t_seq, chunk_size=chunk_size)
+            c_stu_stu = _pairwise_cosine_distance_chunked(s_seq, s_seq, chunk_size=chunk_size)
+            c_tea_tea = _pairwise_cosine_distance_chunked(t_seq, t_seq, chunk_size=chunk_size)
 
-            c_tea_tea = 1.0 - torch.cosine_similarity(
-                t_seq.unsqueeze(1), t_seq.unsqueeze(0), dim=-1
-            )
-            
+            # apply band penalties if your code needs them (unchanged logic)
             if self.dtw_band_source == 'cma' and hasattr(self, 'last_align') and self.last_align is not None and self.dtw_band_width > 0:
-                # last_align is (B, S, T). Slice i-th example and valid spans
                 A = self.last_align[i][:s_len, :t_len]
                 eps = 1e-9
                 A_clamped = (A + eps) / (A.sum(dim=-1, keepdim=True) + eps)
-                row_entropy = -(A_clamped * torch.log(A_clamped)).sum(dim=-1)  # (s_len)
-
-                # Normalized teacher length mapping: i -> i * (t_len / s_len)
+                row_entropy = -(A_clamped * torch.log(A_clamped + eps)).sum(dim=-1)  # (s_len)
                 lin_center = torch.arange(s_len, device=A.device, dtype=torch.float32) * (float(t_len) / float(s_len))
                 soft_center = (A_clamped * torch.arange(t_len, device=A.device).view(1, -1)).sum(dim=-1)
                 alpha = float(self.dtw_band_center_blend)
                 centers = alpha * soft_center + (1.0 - alpha) * lin_center
-
-                # Adaptive width per token
                 base_w = float(self.dtw_band_width)
                 width = base_w + float(self.dtw_band_entropy_coef) * row_entropy
-
-                # Soft penalty mask
                 j = torch.arange(t_len, device=A.device).view(1, -1).float()
                 dist = (j - centers.view(-1, 1)).abs()
                 band = dist <= width.view(-1, 1)
-
-                # Warmup for penalty strength
                 if self.dtw_band_warmup_steps and self.dtw_band_warmup_steps > 0:
                     pen_scale = min(1.0, float(self._global_step + 1) / float(self.dtw_band_warmup_steps))
                 else:
@@ -252,6 +267,7 @@ class DualSpaceKDWithCMA(VariousDivergence):
                 c_stu_tea = c_stu_tea + (~band).float() * penalty
 
             if self.dtw_band_source == 'sdtw' and self.dtw_band_width > 0:
+                # compute alignment A from SoftDTW on smaller c_stu_tea (it fits)
                 _, A = self.dtw.forward_with_cost_matrix(c_stu_tea.unsqueeze(0), return_alignment=True)
                 A = A[0]
                 eps = 1e-9
@@ -273,19 +289,19 @@ class DualSpaceKDWithCMA(VariousDivergence):
                 penalty = float(self.dtw_band_penalty) * pen_scale
                 c_stu_tea = c_stu_tea + (~band).float() * penalty
 
+            # compute SoftDTW scores (s2t, s2s, t2t)
             s2t = self.dtw.forward_with_cost_matrix(c_stu_tea.unsqueeze(0))
             s2s = self.dtw.forward_with_cost_matrix(c_stu_stu.unsqueeze(0))
             t2t = self.dtw.forward_with_cost_matrix(c_tea_tea.unsqueeze(0))
 
             pair_loss = s2t - 0.5 * (s2s + t2t)
-        
             total_loss = total_loss + pair_loss.view(1)
 
-
         if non_empty_pairs == 0:
-            return torch.tensor(0.0, device=student_embs.device, requires_grad=True)
+            return torch.tensor(0.0, device=device)
 
-        return total_loss 
+        return total_loss  # optionally divide by non_empty_pairs if you want mean
+ 
     
     '''
     def _calculate_alignment_loss(self, student_embs, teacher_embs, student_mask, teacher_mask):
