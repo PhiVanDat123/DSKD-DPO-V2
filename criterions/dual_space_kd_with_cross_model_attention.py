@@ -301,59 +301,7 @@ class DualSpaceKDWithCMA(VariousDivergence):
             return torch.tensor(0.0, device=device)
 
         return total_loss  # optionally divide by non_empty_pairs if you want mean
- 
-    
-    '''
-    def _calculate_alignment_loss(self, student_embs, teacher_embs, student_mask, teacher_mask):
-        batch_size = student_embs.size(0)
-        device = student_embs.device
-        total_loss = torch.zeros(1, device=device, requires_grad=True)
-        non_empty_pairs = 0
 
-        def chunked_cosine_similarity(a, b, chunk_size=64):
-            # a: (s_len, hidden), b: (t_len, hidden)
-            s_len, hidden = a.shape
-            t_len = b.shape[0]
-            sim = torch.zeros(s_len, t_len, device=a.device)
-            for i_start in range(0, s_len, chunk_size):
-                i_end = min(i_start + chunk_size, s_len)
-                a_chunk = a[i_start:i_end].unsqueeze(1)  # (chunk, 1, hidden)
-                sim[i_start:i_end] = 1.0 - torch.cosine_similarity(
-                    a_chunk, b.unsqueeze(0), dim=-1
-                )
-            return sim
-
-        for i in range(batch_size):
-            s_len = student_mask[i].sum().item()
-            t_len = teacher_mask[i].sum().item()
-
-            if s_len == 0 or t_len == 0:
-                continue
-            non_empty_pairs += 1
-
-            s_seq = student_embs[i, :s_len, :]
-            t_seq = teacher_embs[i, :t_len, :]
-
-            # Sử dụng chunked cosine similarity để giảm memory
-            c_stu_tea = chunked_cosine_similarity(s_seq, t_seq)
-            c_stu_stu = chunked_cosine_similarity(s_seq, s_seq)
-            c_tea_tea = chunked_cosine_similarity(t_seq, t_seq)
-
-            # --- (Giữ nguyên phần xử lý dtw_band_source như cũ) ---
-            # ... giữ nguyên logic CMA/SDTW band và penalty ...
-
-            s2t = self.dtw.forward_with_cost_matrix(c_stu_tea.unsqueeze(0))
-            s2s = self.dtw.forward_with_cost_matrix(c_stu_stu.unsqueeze(0))
-            t2t = self.dtw.forward_with_cost_matrix(c_tea_tea.unsqueeze(0))
-
-            pair_loss = s2t - 0.5 * (s2s + t2t)
-            total_loss = total_loss + pair_loss  # cộng trực tiếp, không cần view(1)
-
-        if non_empty_pairs == 0:
-            return torch.zeros(1, device=device, requires_grad=True)
-
-        return total_loss
-    '''
 
     def _get_target_embeddings(self, distiller, batch, pad_mask, teacher_pad_mask, model, teacher_model):
         target = batch["chosen_student_labels"]
