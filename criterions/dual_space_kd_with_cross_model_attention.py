@@ -147,7 +147,113 @@ class DualSpaceKDWithCMA(VariousDivergence):
         t2s_logits = t2s_hiddens.matmul(lm_head_w.transpose(-1, -2))
 
         return t2s_logits
+    
 
+    def compute_t2s_logits_chosen(self, batch, distiller, model, reference_model):
+        import torch, math
+
+        # === Xác định device đang chạy ===
+        device = next(model.parameters()).device  
+
+        # Đảm bảo model và teacher nằm đúng device
+        model = model.to(device)
+        teacher_model = reference_model.to(device)
+        teacher_model.eval()
+
+        # === Chỉ chuyển projector nhỏ sang GPU ===
+        for name in ["query", "t2s"]:
+            if name in distiller.projectors:
+                distiller.projectors[name] = distiller.projectors[name].to(device)
+
+        # === Đưa batch sang device (gọn, không thiếu key nào) ===
+        def move_to_device(obj):
+            if isinstance(obj, dict):
+                return {k: move_to_device(v) for k, v in obj.items()}
+            elif torch.is_tensor(obj):
+                return obj.to(device)
+            else:
+                return obj
+
+        batch = move_to_device(batch)
+
+        # === Forward teacher ===
+        teacher_outputs = teacher_model(
+            batch["chosen_teacher_input_ids"],
+            attention_mask=batch["chosen_teacher_attention_mask"],
+            output_hidden_states=True,
+        )
+
+        target = batch["chosen_student_labels"]
+        teacher_target = batch["chosen_teacher_labels"]
+
+        pad_mask = target.ne(self.padding_id)
+        teacher_pad_mask = teacher_target.ne(self.padding_id)
+        teacher_hiddens = teacher_outputs.hidden_states[-1]
+
+        # === Lấy embedding layer student ===
+        if hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
+            stu_embed_tokens = model.model.embed_tokens
+        elif hasattr(model, "model") and hasattr(model.model, "model") and hasattr(model.model.model, "embed_tokens"):
+            stu_embed_tokens = model.model.model.embed_tokens
+        elif hasattr(model, "transformer") and hasattr(model.transformer, "word_embeddings"):
+            stu_embed_tokens = model.transformer.word_embeddings
+        else:
+            raise NotImplementedError("Không tìm thấy embedding layer cho student model")
+
+        # === Lấy embedding layer teacher ===
+        if hasattr(teacher_model, "model") and hasattr(teacher_model.model, "embed_tokens"):
+            tea_embed_tokens = teacher_model.model.embed_tokens
+        elif hasattr(teacher_model, "model") and hasattr(teacher_model.model, "model") and hasattr(teacher_model.model.model, "embed_tokens"):
+            tea_embed_tokens = teacher_model.model.model.embed_tokens
+        elif hasattr(teacher_model, "transformer") and hasattr(teacher_model.transformer, "wte"):
+            tea_embed_tokens = teacher_model.transformer.wte
+        else:
+            raise NotImplementedError("Không tìm thấy embedding layer cho teacher model")
+
+        # === Xử lý input & target embeddings ===
+        formal_target = torch.where(pad_mask, target, torch.zeros_like(target))
+        formal_input = torch.where(pad_mask, batch["chosen_student_input_ids"], torch.zeros_like(target))
+        stu_input_embeds = stu_embed_tokens(formal_input).detach()
+        stu_target_embeds = stu_embed_tokens(formal_target).detach()
+
+        formal_teacher_target = torch.where(teacher_pad_mask, teacher_target, torch.zeros_like(teacher_target))
+        formal_teacher_input = torch.where(teacher_pad_mask, batch["chosen_teacher_input_ids"], torch.zeros_like(teacher_target))
+        tea_input_embeds = tea_embed_tokens(formal_teacher_input).detach()
+        tea_target_embeds = tea_embed_tokens(formal_teacher_target).detach()
+
+        # === Ghép embedding theo logic gốc ===
+        stu_index_embeds = torch.cat([stu_input_embeds, stu_target_embeds], -1)
+        tea_index_embeds = torch.cat([tea_input_embeds, tea_target_embeds], -1)
+
+        # === Chuẩn hóa các tensor teacher ===
+        norm_tea_index_embeds = tea_index_embeds / tea_index_embeds.std()
+        norm_tea_target_embeds = tea_target_embeds / tea_target_embeds.std()
+        norm_teacher_hiddens = teacher_hiddens / teacher_hiddens.std()
+
+        # === Projector ===
+        stu_q_hiddens = distiller.projectors["query"](stu_index_embeds).float()
+        tea_k_hiddens = norm_tea_index_embeds.float()
+        tea_v_hiddens = distiller.projectors["t2s"](
+            norm_teacher_hiddens + norm_tea_target_embeds
+        ).float()
+
+        # === Alignment & attention ===
+        align = stu_q_hiddens.matmul(tea_k_hiddens.transpose(-1, -2))
+        align = align / math.sqrt(2 * teacher_hiddens.shape[-1])
+
+        align_mask = pad_mask.float().unsqueeze(-1) * teacher_pad_mask.float().unsqueeze(1)
+        align = align + (1.0 - align_mask) * (-100000)
+
+        t2s_weight = torch.softmax(align, -1)
+
+        # === Output hidden + logits ===
+        t2s_hiddens = t2s_weight.matmul(tea_v_hiddens)
+
+        lm_head_w = model.lm_head.weight.detach()
+
+        t2s_logits = t2s_hiddens.matmul(lm_head_w.transpose(-1, -2))
+
+        return t2s_logits
 
 
     def compute_dtw_loss(self, batch, distiller, model, reference_model):

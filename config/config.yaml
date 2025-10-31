@@ -102,8 +102,9 @@ teacher_temperature: 1.0
 kd_objective: "forward_kl"  
 
 #dtw
-tis_dpo_rate: 1
-dtw_rate: 1
+tis_dpo_rate: 0.5
+ce_rate: 0.5
+dtw_rate: 0.2
 dtw_gamma: 0.1
 dtw_gamma_start: 0.1 
 dtw_gamma_end: 0.8

@@ -329,7 +329,9 @@ class BasicTrainer(object):
                                                                  chosen_position_kl, rejected_position_kl,
                                                                  beta=loss_config.beta, alpha=loss_config.alpha, token_level=loss_config.token_level)
             loss_dtw = self.DSKD.compute_dtw_loss(batch, self.distiller, self.policy, self.reference_model)
-            losses = self.config.tis_dpo_rate * loss_tisdpo + self.config.dtw_rate * loss_dtw
+            t2s_logits = self.DSKD.compute_t2s_logits_chosen(batch, self.distiller, self.policy, self.reference_model)
+            loss_ce = self.DSKD.compute_cross_entropy_loss(t2s_logits, batch['chosen_student_labels'])
+            losses = self.config.ce_rate * loss_ce + self.config.tis_dpo_rate * loss_tisdpo + self.config.dtw_rate * loss_dtw
             reward_accuracies = (chosen_rewards > rejected_rewards).float()
 
             chosen_rewards = all_gather_if_needed(chosen_rewards, self.rank, self.world_size)
@@ -455,7 +457,6 @@ class BasicTrainer(object):
                 print("[DEBUG_TRAIN] Local microbatch size:", local_microbatch['chosen_student_input_ids'].shape)
                 loss, metrics = self.get_batch_metrics(local_microbatch, self.config.loss, train=True)
                 (loss / self.config.gradient_accumulation_steps).backward()
-                break 
 
                 for k, v in metrics.items():
                     batch_metrics[k].extend(v)

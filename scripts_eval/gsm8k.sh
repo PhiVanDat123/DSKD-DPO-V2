@@ -7,7 +7,7 @@ export LM_EVAL_LOGLEVEL=DEBUG
 export VLLM_LOGLEVEL=INFO
 
 # Define variables
-MODEL_NAME=""
+MODEL_NAME="/home/hungpv/projects/DSKD-DPO-V2/models/Qwen/Qwen2.5-7B"
 TASKS="gsm8k"                # Replace with your desired tasks
 TP_SIZE=4                             # Number of GPUs for tensor parallelism
                              # Number of model replicas
