@@ -329,7 +329,7 @@ class BasicTrainer(object):
                                                                  chosen_position_kl, rejected_position_kl,
                                                                  beta=loss_config.beta, alpha=loss_config.alpha, token_level=loss_config.token_level)
             loss_dtw = self.DSKD.compute_dtw_loss(batch, self.distiller, self.policy, self.reference_model)
-            t2s_logits, _ = self.DSKD.compute_t2s_logits_chosen(batch, self.distiller, self.policy, self.reference_model)
+            t2s_logits = self.DSKD.compute_t2s_logits_chosen(batch, self.distiller, self.policy, self.reference_model)
             loss_ce, _ = self.DSKD.compute_cross_entropy_loss(t2s_logits, batch['chosen_student_labels'].long())
             losses = self.config.ce_rate * loss_ce + self.config.tis_dpo_rate * loss_tisdpo + self.config.dtw_rate * loss_dtw
             reward_accuracies = (chosen_rewards > rejected_rewards).float()
